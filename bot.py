@@ -18,8 +18,11 @@ OWNER_CHAT_ID = 760930914
 CHAIN_FILTER = "bsc"
 MIN_LIQUIDITY = 10000
 MIN_VOLUME = 5000
+
+# Better for Render / light deployment
 CHECK_INTERVAL = 180
 MAX_ALERTS_PER_CYCLE = 1
+
 DATA_FILE = "bot_data.json"
 
 subscribers = set()
@@ -30,6 +33,8 @@ user_activity = {}
 analyze_count = 0
 last_check_time = "Not started yet"
 last_alert_message = "No alerts yet"
+
+# NEW: search tracking
 search_history = []
 search_counts = {}
 
@@ -91,10 +96,12 @@ def get_active_users(days=1):
     return count
 
 
+# NEW: normalize search term
 def normalize_search_term(term: str) -> str:
     return term.strip().lower()
 
 
+# NEW: record each search
 def record_search(chat_id, query):
     global search_history, search_counts
 
@@ -112,17 +119,20 @@ def record_search(chat_id, query):
 
     search_counts[cleaned] = search_counts.get(cleaned, 0) + 1
 
+    # Keep history from growing forever
     if len(search_history) > 5000:
         search_history = search_history[-5000:]
 
     save_data()
 
 
+# NEW: get top searches all-time
 def get_top_searches(limit=5):
     items = sorted(search_counts.items(), key=lambda x: x[1], reverse=True)
     return items[:limit]
 
 
+# NEW: get top searches in last X days
 def get_top_searches_recent(days=1, limit=5):
     now = datetime.now()
     recent_counts = {}
@@ -142,8 +152,8 @@ def get_top_searches_recent(days=1, limit=5):
 
 def main_menu():
     keyboard = [
-        [InlineKeyboardButton("✅ Enable Alerts", callback_data="alerts_on")],
-        [InlineKeyboardButton("⛔ Disable Alerts", callback_data="alerts_off")],
+        [InlineKeyboardButton("✅ Enable Alerts", callback_data="subscribe")],
+        [InlineKeyboardButton("⛔ Disable Alerts", callback_data="unsubscribe")],
         [InlineKeyboardButton("📊 Status", callback_data="status")],
         [InlineKeyboardButton("🧠 Analyze Token", callback_data="analyze_prompt")],
         [InlineKeyboardButton("🧪 Last Alert", callback_data="last_alert")],
@@ -326,8 +336,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "*Commands:*\n"
         "/start - launch the bot\n"
         "/status - current bot status\n"
-        "/alerts_on - enable alerts\n"
-        "/alerts_off - disable alerts\n"
+        "/subscribe - enable alerts\n"
+        "/unsubscribe - disable alerts\n"
         "/analyze - start token analysis flow\n"
         "/analytics - owner-only metrics\n"
         "/myid - show your chat id\n\n"
@@ -385,7 +395,7 @@ async def analytics_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, parse_mode="Markdown")
 
 
-async def alerts_on_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def subscribe_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cid = update.effective_chat.id
     subscribers.add(cid)
     track_user(cid)
@@ -393,7 +403,7 @@ async def alerts_on_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("✅ Alerts enabled for your account.", reply_markup=main_menu())
 
 
-async def alerts_off_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def unsubscribe_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cid = update.effective_chat.id
     subscribers.discard(cid)
     track_user(cid)
@@ -405,7 +415,7 @@ async def analyze_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cid = update.effective_chat.id
     waiting_for_analysis.add(cid)
     track_user(cid)
-    await update.message.reply_text("Send token name, symbol, or contract address.")
+    await update.message.reply_text("Send token name or contract")
 
 
 async def auto_analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -421,13 +431,14 @@ async def auto_analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
     track_user(cid)
     analyze_count += 1
 
+    # NEW: record the search
     record_search(cid, query_text)
     save_data()
 
     pairs = search_pairs(query_text)
 
     if not pairs:
-        await update.message.reply_text("No result found.")
+        await update.message.reply_text("No result")
         return
 
     filtered = [p for p in pairs if p.get("chainId", "").lower() == CHAIN_FILTER]
@@ -437,7 +448,7 @@ async def auto_analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
     best = choose_best_pair(pairs)
 
     if not best:
-        await update.message.reply_text("No result found.")
+        await update.message.reply_text("No result")
         return
 
     await update.message.reply_text(build_msg(best), parse_mode="Markdown")
@@ -449,11 +460,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cid = query.message.chat_id
     track_user(cid)
 
-    if query.data == "alerts_on":
+    if query.data == "subscribe":
         subscribers.add(cid)
         save_data()
         text = "✅ Alerts enabled."
-    elif query.data == "alerts_off":
+    elif query.data == "unsubscribe":
         subscribers.discard(cid)
         save_data()
         text = "⛔ Alerts disabled."
@@ -477,7 +488,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     elif query.data == "analyze_prompt":
         waiting_for_analysis.add(cid)
-        text = "Send token name, symbol, or contract address."
+        text = "Send token name or contract"
     else:
         text = "Unknown option."
 
@@ -494,6 +505,7 @@ async def check_new(context: ContextTypes.DEFAULT_TYPE):
         print("No profiles returned.")
         return
 
+    # First cycle: cache only, no sending
     if not seen_tokens:
         for item in profiles:
             chain = item.get("chainId")
@@ -565,13 +577,13 @@ app.add_handler(CommandHandler("help", help_command))
 app.add_handler(CommandHandler("status", status_command))
 app.add_handler(CommandHandler("analytics", analytics_command))
 app.add_handler(CommandHandler("analyze", analyze_command))
-app.add_handler(CommandHandler("alerts_on", alerts_on_command))
-app.add_handler(CommandHandler("alerts_off", alerts_off_command))
+app.add_handler(CommandHandler("subscribe", subscribe_command))
+app.add_handler(CommandHandler("unsubscribe", unsubscribe_command))
 app.add_handler(CommandHandler("myid", myid_command))
 app.add_handler(CallbackQueryHandler(button_handler))
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, auto_analyze))
 
 app.job_queue.run_repeating(check_new, interval=CHECK_INTERVAL, first=10)
 
-print("Bot is running...")
+print("Bot running...")
 app.run_polling()
