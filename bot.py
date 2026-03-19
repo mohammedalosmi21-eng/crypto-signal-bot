@@ -1007,17 +1007,50 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data.startswith("token_detail:"):
         token_key = data.split(":", 1)[1]
+        log.info(f"token_detail clicked by {cid}: {token_key}")
         entry = db.get_tracked_token(cid, token_key)
         if not entry:
-            await query.edit_message_text("Token not found in your list.", reply_markup=main_menu_for(cid))
+            try:
+                await query.answer("Token not found.", show_alert=True)
+            except Exception:
+                await query.answer("Token not found.")
+            try:
+                await query.edit_message_text("Token not found in your list.", reply_markup=main_menu_for(cid))
+            except Exception as e:
+                log.warning(f"token_detail: could not edit missing-token message for {cid}/{token_key}: {e}")
+                await context.bot.send_message(
+                    chat_id=cid,
+                    text="Token not found in your list.",
+                    reply_markup=main_menu_for(cid),
+                )
             return
+
         text = (
             f"⚙️ *Alert Settings — {escape_markdown(entry['symbol'], version=1)}*\n"
             f"Chain: {escape_markdown(entry['chain'].upper(), version=1)}\n"
             f"Added: {escape_markdown(entry['added_at'], version=1)}\n\n"
             "Toggle the alerts you want below:"
         )
-        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=alert_prefs_menu(cid, token_key))
+
+        try:
+            await query.answer("Opening alert settings ⚙️")
+        except Exception:
+            pass
+
+        try:
+            await query.edit_message_text(
+                text,
+                parse_mode="Markdown",
+                reply_markup=alert_prefs_menu(cid, token_key),
+            )
+        except Exception as e:
+            log.warning(f"token_detail: edit_message_text failed for {cid}/{token_key}: {e}")
+            await context.bot.send_message(
+                chat_id=cid,
+                text=text,
+                parse_mode="Markdown",
+                reply_markup=alert_prefs_menu(cid, token_key),
+            )
         return
 
     if data.startswith("track_add:"):
