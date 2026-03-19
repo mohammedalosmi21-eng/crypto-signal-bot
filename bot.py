@@ -518,10 +518,10 @@ def alert_prefs_menu(chat_id: int, token_key: str) -> InlineKeyboardMarkup:
         return f"{'✅' if alerts.get(pref) else '❌'} {display}"
 
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton(label("price_change", "Price Change"), callback_data=f"pref:{token_key}:price_change")],
-        [InlineKeyboardButton(label("volume_spike", "Volume Spike"), callback_data=f"pref:{token_key}:volume_spike")],
-        [InlineKeyboardButton(label("liquidity_change", "Liquidity Change"), callback_data=f"pref:{token_key}:liquidity_change")],
-        [InlineKeyboardButton(label("unusual_activity", "Unusual Activity"), callback_data=f"pref:{token_key}:unusual_activity")],
+        [InlineKeyboardButton(label("price_change", "Price Change"), callback_data=f"pref|price_change|{token_key}")],
+        [InlineKeyboardButton(label("volume_spike", "Volume Spike"), callback_data=f"pref|volume_spike|{token_key}")],
+        [InlineKeyboardButton(label("liquidity_change", "Liquidity Change"), callback_data=f"pref|liquidity_change|{token_key}")],
+        [InlineKeyboardButton(label("unusual_activity", "Unusual Activity"), callback_data=f"pref|unusual_activity|{token_key}")],
         [InlineKeyboardButton("🗑 Stop Tracking", callback_data=f"track_remove:{token_key}")],
         [InlineKeyboardButton("⬅️ Back", callback_data="my_tokens")],
     ])
@@ -1011,13 +1011,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         entry = db.get_tracked_token(cid, token_key)
         if not entry:
             try:
-                await query.answer("Token not found.", show_alert=True)
+                await query.answer("Token not found", show_alert=True)
             except Exception:
-                await query.answer("Token not found.")
+                pass
             try:
                 await query.edit_message_text("Token not found in your list.", reply_markup=main_menu_for(cid))
-            except Exception as e:
-                log.warning(f"token_detail: could not edit missing-token message for {cid}/{token_key}: {e}")
+            except Exception:
                 await context.bot.send_message(
                     chat_id=cid,
                     text="Token not found in your list.",
@@ -1025,7 +1024,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
             return
 
-        text = (
+        settings_text = (
             f"⚙️ *Alert Settings — {escape_markdown(entry['symbol'], version=1)}*\n"
             f"Chain: {escape_markdown(entry['chain'].upper(), version=1)}\n"
             f"Added: {escape_markdown(entry['added_at'], version=1)}\n\n"
@@ -1033,21 +1032,21 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
         try:
-            await query.answer("Opening alert settings ⚙️")
+            await query.answer("Opening alert settings…")
         except Exception:
             pass
 
         try:
             await query.edit_message_text(
-                text,
+                settings_text,
                 parse_mode="Markdown",
                 reply_markup=alert_prefs_menu(cid, token_key),
             )
         except Exception as e:
-            log.warning(f"token_detail: edit_message_text failed for {cid}/{token_key}: {e}")
+            log.warning(f"token_detail fallback send_message for {cid}/{token_key}: {e}")
             await context.bot.send_message(
                 chat_id=cid,
-                text=text,
+                text=settings_text,
                 parse_mode="Markdown",
                 reply_markup=alert_prefs_menu(cid, token_key),
             )
@@ -1141,25 +1140,62 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    if data.startswith("pref:"):
-        parts = data.split(":", 2)
+    if data.startswith("pref|"):
+        parts = data.split("|", 2)
         if len(parts) != 3:
-            await query.edit_message_text("Invalid preference.", reply_markup=main_menu_for(cid))
+            try:
+                await query.answer("Invalid preference", show_alert=True)
+            except Exception:
+                pass
+            try:
+                await query.edit_message_text("Invalid preference.", reply_markup=main_menu_for(cid))
+            except Exception:
+                await context.bot.send_message(chat_id=cid, text="Invalid preference.", reply_markup=main_menu_for(cid))
             return
-        _, token_key, pref = parts
+
+        _, pref, token_key = parts
+        log.info(f"pref toggle clicked by {cid}: {pref} for {token_key}")
         entry = db.get_tracked_token(cid, token_key)
         if not entry:
-            await query.edit_message_text("Token not found.", reply_markup=main_menu_for(cid))
+            try:
+                await query.answer("Token not found", show_alert=True)
+            except Exception:
+                pass
+            try:
+                await query.edit_message_text("Token not found.", reply_markup=main_menu_for(cid))
+            except Exception:
+                await context.bot.send_message(chat_id=cid, text="Token not found.", reply_markup=main_menu_for(cid))
             return
+
         current = entry["alerts"].get(pref, False)
         db.set_alert_pref(cid, token_key, pref, not current)
         db.save()
-        text = (
+
+        settings_text = (
             f"⚙️ *Alert Settings — {escape_markdown(entry['symbol'], version=1)}*\n"
             f"Chain: {escape_markdown(entry['chain'].upper(), version=1)}\n\n"
             "Toggle the alerts you want below:"
         )
-        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=alert_prefs_menu(cid, token_key))
+
+        try:
+            await query.answer(f"{pref.replace('_', ' ').title()} {'enabled' if not current else 'disabled'}")
+        except Exception:
+            pass
+
+        try:
+            await query.edit_message_text(
+                settings_text,
+                parse_mode="Markdown",
+                reply_markup=alert_prefs_menu(cid, token_key),
+            )
+        except Exception as e:
+            log.warning(f"pref fallback send_message for {cid}/{token_key}: {e}")
+            await context.bot.send_message(
+                chat_id=cid,
+                text=settings_text,
+                parse_mode="Markdown",
+                reply_markup=alert_prefs_menu(cid, token_key),
+            )
         return
 
     await query.edit_message_text("Unknown option.", reply_markup=main_menu_for(cid))
