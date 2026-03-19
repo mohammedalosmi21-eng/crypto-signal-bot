@@ -544,7 +544,7 @@ def my_tokens_menu(chat_id: int) -> InlineKeyboardMarkup:
     rows = []
     for t in tracked:
         label = f"{t['symbol']} ({t['chain'].upper()})"
-        rows.append([InlineKeyboardButton(label, callback_data=f"token_detail:{t['token_key']}")])
+        rows.append([InlineKeyboardButton(label, callback_data=f"token_detail|{t['token_key']}")])
     rows.append([InlineKeyboardButton("⬅️ Back", callback_data="back_main")])
     return InlineKeyboardMarkup(rows)
 
@@ -1005,23 +1005,21 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         return
 
-    if data.startswith("token_detail:"):
-        token_key = data.split(":", 1)[1]
+    if data.startswith("token_detail|"):
+        token_key = data.split("|", 1)[1]
         log.info(f"token_detail clicked by {cid}: {token_key}")
         entry = db.get_tracked_token(cid, token_key)
+
         if not entry:
             try:
                 await query.answer("Token not found", show_alert=True)
             except Exception:
                 pass
-            try:
-                await query.edit_message_text("Token not found in your list.", reply_markup=main_menu_for(cid))
-            except Exception:
-                await context.bot.send_message(
-                    chat_id=cid,
-                    text="Token not found in your list.",
-                    reply_markup=main_menu_for(cid),
-                )
+            await context.bot.send_message(
+                chat_id=cid,
+                text="Token not found in your list.",
+                reply_markup=main_menu_for(cid),
+            )
             return
 
         settings_text = (
@@ -1032,24 +1030,16 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
         try:
-            await query.answer("Opening alert settings…")
+            await query.answer("Opening alert settings…", show_alert=False)
         except Exception:
             pass
 
-        try:
-            await query.edit_message_text(
-                settings_text,
-                parse_mode="Markdown",
-                reply_markup=alert_prefs_menu(cid, token_key),
-            )
-        except Exception as e:
-            log.warning(f"token_detail fallback send_message for {cid}/{token_key}: {e}")
-            await context.bot.send_message(
-                chat_id=cid,
-                text=settings_text,
-                parse_mode="Markdown",
-                reply_markup=alert_prefs_menu(cid, token_key),
-            )
+        await context.bot.send_message(
+            chat_id=cid,
+            text=settings_text,
+            parse_mode="Markdown",
+            reply_markup=alert_prefs_menu(cid, token_key),
+        )
         return
 
     if data.startswith("track_add:"):
@@ -1147,10 +1137,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.answer("Invalid preference", show_alert=True)
             except Exception:
                 pass
-            try:
-                await query.edit_message_text("Invalid preference.", reply_markup=main_menu_for(cid))
-            except Exception:
-                await context.bot.send_message(chat_id=cid, text="Invalid preference.", reply_markup=main_menu_for(cid))
+            await context.bot.send_message(chat_id=cid, text="Invalid preference.", reply_markup=main_menu_for(cid))
             return
 
         _, pref, token_key = parts
@@ -1161,19 +1148,17 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.answer("Token not found", show_alert=True)
             except Exception:
                 pass
-            try:
-                await query.edit_message_text("Token not found.", reply_markup=main_menu_for(cid))
-            except Exception:
-                await context.bot.send_message(chat_id=cid, text="Token not found.", reply_markup=main_menu_for(cid))
+            await context.bot.send_message(chat_id=cid, text="Token not found.", reply_markup=main_menu_for(cid))
             return
 
         current = entry["alerts"].get(pref, False)
         db.set_alert_pref(cid, token_key, pref, not current)
         db.save()
 
+        refreshed = db.get_tracked_token(cid, token_key)
         settings_text = (
-            f"⚙️ *Alert Settings — {escape_markdown(entry['symbol'], version=1)}*\n"
-            f"Chain: {escape_markdown(entry['chain'].upper(), version=1)}\n\n"
+            f"⚙️ *Alert Settings — {escape_markdown(refreshed['symbol'], version=1)}*\n"
+            f"Chain: {escape_markdown(refreshed['chain'].upper(), version=1)}\n\n"
             "Toggle the alerts you want below:"
         )
 
@@ -1182,20 +1167,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
 
-        try:
-            await query.edit_message_text(
-                settings_text,
-                parse_mode="Markdown",
-                reply_markup=alert_prefs_menu(cid, token_key),
-            )
-        except Exception as e:
-            log.warning(f"pref fallback send_message for {cid}/{token_key}: {e}")
-            await context.bot.send_message(
-                chat_id=cid,
-                text=settings_text,
-                parse_mode="Markdown",
-                reply_markup=alert_prefs_menu(cid, token_key),
-            )
+        await context.bot.send_message(
+            chat_id=cid,
+            text=settings_text,
+            parse_mode="Markdown",
+            reply_markup=alert_prefs_menu(cid, token_key),
+        )
         return
 
     await query.edit_message_text("Unknown option.", reply_markup=main_menu_for(cid))
@@ -1496,7 +1473,6 @@ log.info("=== DEPLOY MARKER V3 ===")
 log.info("Bot V2 running...")
 log.info("Job queue available: %s", bool(app.job_queue))
 log.info("Bot V2 production file running...")
-log.info("=== MANAGE ALERTS INSIDE MY TOKENS ONLY ===")
-log.info("=== MANAGE ALERTS INSIDE MY TOKENS ONLY V2 ===")
+log.info("=== MANAGE ALERTS FRESH MESSAGE FIX V1 ===")
 app.run_polling()
 
