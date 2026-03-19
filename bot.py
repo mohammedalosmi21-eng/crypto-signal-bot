@@ -1055,6 +1055,7 @@ async def check_tracked_tokens(context: ContextTypes.DEFAULT_TYPE):
       pair re-fetching. Symbol-fallback token_keys are skipped safely.
     - Multiple users tracking the same token share one API fetch per cycle.
     """
+    log.info("check_tracked_tokens STARTED")
     if not db.tracked_tokens:
         return
 
@@ -1205,6 +1206,7 @@ async def check_tracked_tokens(context: ContextTypes.DEFAULT_TYPE):
             })
 
     db.save()
+    log.info("check_tracked_tokens COMPLETED")
     log.info(
         f"check_tracked_tokens: completed. {api_call_count} API call(s), "
         f"{len(token_to_record_keys)} unique token(s), {alerts_sent} alert(s) sent."
@@ -1240,9 +1242,12 @@ try:
         app.job_queue.run_repeating(check_tracked_tokens, interval=300, first=30)
         log.info("Job queue started.")
     else:
-        log.warning("job_queue is None — background jobs disabled. Install python-telegram-bot[job-queue].")
+        log.warning("Job queue NOT available — background jobs DISABLED")
 except Exception as e:
     log.warning(f"Could not start job queue: {e}")
 
+log.info("=== DEPLOY MARKER V3 ===")
+log.info("Bot V2 running...")
+log.info("Job queue available: %s", bool(app.job_queue))
 log.info("Bot V2 production file running...")
 app.run_polling()
