@@ -26,7 +26,7 @@ import asyncio
 # CONFIG
 # ─────────────────────────────────────────────
 
-TOKEN = os.getenv("8713422124:AAFv3kYJgGrxEYS8ogtXJpqpOYekp7-OwVo")
+TOKEN = os.getenv("BOT_TOKEN")
 OWNER_CHAT_ID = 760930914
 
 CHAIN_FILTER = "bsc"
