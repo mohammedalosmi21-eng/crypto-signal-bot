@@ -687,7 +687,7 @@ async def mytokens_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    text = "📋 *Your Tracked Tokens*\nTap a token to manage alert preferences.\n"
+    text = "📋 *Your Tracked Tokens*\nTap a token to manage alert preferences or remove it.\n"
     await update.message.reply_text(text, parse_mode="Markdown", reply_markup=my_tokens_menu(cid))
 
 
@@ -883,7 +883,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not already_tracked:
         await update.message.reply_text(
-            f"📌 Want to track *{escape_markdown(symbol, version=1)}* for alerts?",
+            f"📌 Do you want to add *{escape_markdown(symbol, version=1)}* to your tracked list?",
             parse_mode="Markdown",
             reply_markup=track_prompt_menu(token_key),
         )
@@ -991,7 +991,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         else:
             await query.edit_message_text(
-                "📋 *Your Tracked Tokens*\nTap a token to manage its alert settings.",
+                "📋 *Your Tracked Tokens*\nTap a token to manage its alert settings or remove it.",
                 parse_mode="Markdown",
                 reply_markup=my_tokens_menu(cid),
             )
@@ -1020,14 +1020,40 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         name = pending.get("name", "???")
         chain = pending.get("chain", "unknown")
 
+        already_exists = db.get_tracked_token(cid, token_key) is not None
         db.track_token(cid, token_key, symbol, name, chain)
         db.save()
+        context.user_data.pop("pending_track", None)
 
-        text = (
-            f"✅ *{escape_markdown(symbol, version=1)}* added to your tracked tokens.\n\n"
-            "Configure your alert preferences:"
-        )
-        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=alert_prefs_menu(cid, token_key))
+        safe_symbol = escape_markdown(symbol, version=1)
+
+        if already_exists:
+            text = (
+                f"ℹ️ *{safe_symbol}* is already in your tracked list.\n\n"
+                "You can manage alerts or remove it below:"
+            )
+        else:
+            text = (
+                f"✅ *{safe_symbol}* was added to your tracked list.\n\n"
+                "You can manage alerts or remove it below:"
+            )
+
+        await query.answer("Token added ✅" if not already_exists else "Already tracked ℹ️")
+
+        try:
+            await query.edit_message_text(
+                text,
+                parse_mode="Markdown",
+                reply_markup=alert_prefs_menu(cid, token_key),
+            )
+        except Exception as e:
+            log.warning(f"track_add: edit_message_text failed for {cid}/{token_key}: {e}")
+            await context.bot.send_message(
+                chat_id=cid,
+                text=text,
+                parse_mode="Markdown",
+                reply_markup=alert_prefs_menu(cid, token_key),
+            )
         return
 
     if data == "track_skip":
@@ -1167,6 +1193,8 @@ async def check_tracked_tokens(context: ContextTypes.DEFAULT_TYPE):
     """
     log.info("check_tracked_tokens STARTED")
     if not db.tracked_tokens:
+        log.info("check_tracked_tokens COMPLETED")
+        log.info("check_tracked_tokens: no tracked tokens.")
         return
 
     token_to_record_keys: dict[str, list[str]] = {}
@@ -1179,6 +1207,8 @@ async def check_tracked_tokens(context: ContextTypes.DEFAULT_TYPE):
         token_to_record_keys.setdefault(token_key, []).append(record_key)
 
     if not token_to_record_keys:
+        log.info("check_tracked_tokens COMPLETED")
+        log.info("check_tracked_tokens: no trackable address-based tokens.")
         return
 
     api_call_count = 0
@@ -1363,3 +1393,4 @@ log.info("Bot V2 running...")
 log.info("Job queue available: %s", bool(app.job_queue))
 log.info("Bot V2 production file running...")
 app.run_polling()
+
