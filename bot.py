@@ -1,6 +1,6 @@
 """
 Only Signals Bot — Version 2 (Production-ready single file)
-Architecture: per-user state, token tracking, optional global alerts
+Architecture: per-user state, token tracking, optional new-token alerts, developer contact
 Storage: JSON (schema ready for PostgreSQL migration)
 Deployment: Railway / any Python host
 """
@@ -62,9 +62,9 @@ def _now() -> str:
 def default_user(chat_id: int) -> dict:
     return {
         "chat_id": chat_id,
-        "state": "idle",                  # idle | awaiting_search
+        "state": "idle",                  # idle | awaiting_search | awaiting_feedback
         "last_search_query": None,
-        "global_alerts": False,
+        "token_alerts": False,
         "blocked": False,
         "first_seen": _now(),
         "last_active": _now(),
@@ -137,16 +137,16 @@ class BotData:
     def get_last_search(self, chat_id: int):
         return self.get_user(chat_id).get("last_search_query")
 
-    def global_alerts_enabled(self, chat_id: int) -> bool:
-        return self.get_user(chat_id).get("global_alerts", False)
+    def token_alerts_enabled(self, chat_id: int) -> bool:
+        return self.get_user(chat_id).get("token_alerts", False)
 
-    def set_global_alerts(self, chat_id: int, enabled: bool):
-        self.get_user(chat_id)["global_alerts"] = enabled
+    def set_token_alerts(self, chat_id: int, enabled: bool):
+        self.get_user(chat_id)["token_alerts"] = enabled
 
-    def global_alert_subscribers(self) -> list:
+    def token_alert_subscribers(self) -> list:
         return [
             int(uid) for uid, u in self.users.items()
-            if u.get("global_alerts") and not u.get("blocked")
+            if u.get("token_alerts") and not u.get("blocked")
         ]
 
     # ── tracked token helpers ─────────────────
@@ -230,6 +230,9 @@ class BotData:
 
             if "users" in raw:
                 self.users = raw.get("users", {})
+                for u in self.users.values():
+                    if "global_alerts" in u and "token_alerts" not in u:
+                        u["token_alerts"] = u.pop("global_alerts")
                 self.tracked_tokens = raw.get("tracked_tokens", {})
                 self.search_history = raw.get("search_history", [])
                 self.search_counts = raw.get("search_counts", {})
@@ -248,13 +251,13 @@ class BotData:
                     u = self.get_user(cid)
                     u["last_active"] = old_activity[cid_str]
                     if cid in old_subs:
-                        u["global_alerts"] = True
+                        u["token_alerts"] = True
                     if cid in old_blocked:
                         u["blocked"] = True
 
                 for cid in old_subs:
                     u = self.get_user(cid)
-                    u["global_alerts"] = True
+                    u["token_alerts"] = True
 
                 self.search_history = raw.get("search_history", [])
                 self.search_counts = raw.get("search_counts", {})
@@ -479,9 +482,9 @@ def can_query_token_pairs(token_key: str) -> bool:
 # ─────────────────────────────────────────────
 
 def main_menu_for(chat_id: int) -> InlineKeyboardMarkup:
-    enabled = db.global_alerts_enabled(chat_id)
-    toggle_label = "🌐 Global Alerts: ON ✅" if enabled else "🌐 Global Alerts: OFF ❌"
-    toggle_data = "global_alerts_off" if enabled else "global_alerts_on"
+    enabled = db.token_alerts_enabled(chat_id)
+    toggle_label = "🔥 New Token Alerts: ON ✅" if enabled else "🔥 New Token Alerts: OFF ❌"
+    toggle_data = "token_alerts_off" if enabled else "token_alerts_on"
 
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🔍 Search Token", callback_data="search_prompt")],
@@ -490,6 +493,7 @@ def main_menu_for(chat_id: int) -> InlineKeyboardMarkup:
             InlineKeyboardButton("📊 Status", callback_data="status"),
         ],
         [InlineKeyboardButton(toggle_label, callback_data=toggle_data)],
+        [InlineKeyboardButton("💬 Contact Developer", callback_data="contact_prompt")],
         [InlineKeyboardButton("❓ Help", callback_data="help")],
     ])
 
@@ -566,7 +570,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "*What this bot does:*\n"
         "🔍 Search any token by name, symbol, or contract\n"
         "📌 Track tokens and set your own alert preferences\n"
-        "🌐 Optionally subscribe to global new-token alerts\n\n"
+        "🔥 Optionally enable alerts for strong new tokens\n💬 Contact the developer for feedback or support\n\n"
         "Start by searching a token below 👇"
     )
 
@@ -604,12 +608,12 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cid = update.effective_chat.id
     db.touch_user(cid)
 
-    global_on = "Enabled ✅" if db.global_alerts_enabled(cid) else "Disabled ❌"
+    global_on = "Enabled ✅" if db.token_alerts_enabled(cid) else "Disabled ❌"
     tracked_count = len(db.get_tracked(cid))
 
     text = (
         "📊 *Your Status*\n\n"
-        f"🌐 Global Alerts: {global_on}\n"
+        f"🔥 New Token Alerts: {global_on}\n"
         f"📌 Tokens Tracked: {tracked_count}\n\n"
         f"*Bot Filters*\n"
         f"🔗 Chain: {CHAIN_FILTER.upper()}\n"
@@ -628,7 +632,7 @@ async def analytics_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⛔ Owner only.")
         return
 
-    global_subs = len(db.global_alert_subscribers())
+    global_subs = len(db.token_alert_subscribers())
     total_users = len(db.users)
     blocked_count = sum(1 for u in db.users.values() if u.get("blocked"))
     tracked_total = len(db.tracked_tokens)
@@ -648,7 +652,7 @@ async def analytics_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
         "📈 *Owner Analytics*\n\n"
         f"👥 Total Users: {total_users}\n"
-        f"🌐 Global Alert Subscribers: {global_subs}\n"
+        f"🔥 New Token Alert Subscribers: {global_subs}\n"
         f"📌 Total Tracked Tokens: {tracked_total}\n"
         f"🚫 Blocked: {blocked_count}\n"
         f"🧠 Total Analyses: {db.analyze_count}\n"
@@ -687,6 +691,54 @@ async def mytokens_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, parse_mode="Markdown", reply_markup=my_tokens_menu(cid))
 
 
+async def contact_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cid = update.effective_chat.id
+    db.set_state(cid, "awaiting_feedback")
+    db.touch_user(cid)
+    db.save()
+    await update.message.reply_text(
+        "💬 Send your message for the developer.\n\n"
+        "You can send:\n"
+        "- bug reports\n"
+        "- feature requests\n"
+        "- feedback\n\n"
+        "Type your message in the next reply."
+    )
+
+
+async def reply_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cid = update.effective_chat.id
+    if cid != OWNER_CHAT_ID:
+        await update.message.reply_text("⛔ Owner only.")
+        return
+
+    if len(context.args) < 2:
+        await update.message.reply_text("Usage: /reply <chat_id> <message>")
+        return
+
+    target_raw = context.args[0].strip()
+    if not target_raw.isdigit():
+        await update.message.reply_text("Invalid chat_id.")
+        return
+
+    target_chat_id = int(target_raw)
+    reply_text = " ".join(context.args[1:]).strip()
+    if not reply_text:
+        await update.message.reply_text("Message cannot be empty.")
+        return
+
+    try:
+        await context.bot.send_message(
+            chat_id=target_chat_id,
+            text=f"💬 *Developer Reply*\n\n{escape_markdown(reply_text, version=1)}",
+            parse_mode="Markdown",
+        )
+        await update.message.reply_text("✅ Reply sent.")
+    except Exception as e:
+        log.warning(f"reply_command failed for {target_chat_id}: {e}")
+        await update.message.reply_text(f"❌ Failed to send reply: {e}")
+
+
 async def myid_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"Your Chat ID: `{update.effective_chat.id}`",
@@ -700,22 +752,22 @@ async def analyze_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def subscribe_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cid = update.effective_chat.id
-    db.set_global_alerts(cid, True)
+    db.set_token_alerts(cid, True)
     db.touch_user(cid)
     db.save()
     await update.message.reply_text(
-        "🌐 Global alerts enabled. You'll receive new token alerts when they pass the filter.",
+        "🔥 New token alerts enabled. You'll receive alerts when strong new tokens pass the filter.",
         reply_markup=main_menu_for(cid),
     )
 
 
 async def unsubscribe_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cid = update.effective_chat.id
-    db.set_global_alerts(cid, False)
+    db.set_token_alerts(cid, False)
     db.touch_user(cid)
     db.save()
     await update.message.reply_text(
-        "🌐 Global alerts disabled.",
+        "🔥 New token alerts disabled.",
         reply_markup=main_menu_for(cid),
     )
 
@@ -728,9 +780,57 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cid = update.effective_chat.id
     state = db.get_state(cid)
 
+    if state == "awaiting_feedback":
+        feedback_text = (update.message.text or "").strip()
+        if not feedback_text:
+            await update.message.reply_text("Please send a non-empty message.")
+            return
+
+        db.set_state(cid, "idle")
+        db.touch_user(cid)
+        db.save()
+
+        user = update.effective_user
+        username = f"@{user.username}" if user and user.username else "No username"
+        full_name = user.full_name if user else "Unknown user"
+
+        owner_message = (
+            "💬 *User Feedback / Support Message*\n\n"
+            f"*From:* {escape_markdown(full_name, version=1)}\n"
+            f"*Username:* {escape_markdown(username, version=1)}\n"
+            f"*Chat ID:* `{cid}`\n\n"
+            f"*Message:*\n{escape_markdown(feedback_text, version=1)}\n\n"
+            "Reply with:\n"
+            f"`/reply {cid} your message`"
+        )
+
+        delivery_ok = True
+        try:
+            await context.bot.send_message(
+                chat_id=OWNER_CHAT_ID,
+                text=owner_message,
+                parse_mode="Markdown",
+            )
+        except Exception as e:
+            delivery_ok = False
+            log.warning(f"Failed to forward user feedback from {cid}: {e}")
+
+        if delivery_ok:
+            await update.message.reply_text(
+                "✅ Your message was sent to the developer.\n\n"
+                "You should receive a reply here if needed.",
+                reply_markup=main_menu_for(cid),
+            )
+        else:
+            await update.message.reply_text(
+                "❌ Failed to send your message right now. Please try again later.",
+                reply_markup=main_menu_for(cid),
+            )
+        return
+
     if state != "awaiting_search":
         await update.message.reply_text(
-            "Use the menu or /search to look up a token.",
+            "Use the menu or /search to look up a token, or use Contact Developer if you want support.",
             reply_markup=main_menu_for(cid),
         )
         return
@@ -814,32 +914,32 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("🔍 Send a token name, symbol, or contract address:")
         return
 
-    if data == "global_alerts_on":
-        db.set_global_alerts(cid, True)
+    if data == "token_alerts_on":
+        db.set_token_alerts(cid, True)
         db.save()
         await query.edit_message_text(
-            "🌐 *Global Alerts Enabled*\n\nYou'll receive alerts when new tokens pass the filter.",
+            "🔥 *New Token Alerts Enabled*\n\nYou'll receive alerts when strong new tokens pass the filter.",
             parse_mode="Markdown",
             reply_markup=main_menu_for(cid),
         )
         return
 
-    if data == "global_alerts_off":
-        db.set_global_alerts(cid, False)
+    if data == "token_alerts_off":
+        db.set_token_alerts(cid, False)
         db.save()
         await query.edit_message_text(
-            "🌐 *Global Alerts Disabled*\n\nYou won't receive broadcast alerts.\nYour tracked tokens are unaffected.",
+            "🔥 *New Token Alerts Disabled*\n\nYou won't receive alerts about strong new tokens.\nYour tracked tokens are unaffected.",
             parse_mode="Markdown",
             reply_markup=main_menu_for(cid),
         )
         return
 
     if data == "status":
-        global_on = "Enabled ✅" if db.global_alerts_enabled(cid) else "Disabled ❌"
+        global_on = "Enabled ✅" if db.token_alerts_enabled(cid) else "Disabled ❌"
         tracked_count = len(db.get_tracked(cid))
         text = (
             "📊 *Your Status*\n\n"
-            f"🌐 Global Alerts: {global_on}\n"
+            f"🔥 New Token Alerts: {global_on}\n"
             f"📌 Tokens Tracked: {tracked_count}\n\n"
             f"*Bot Filters*\n"
             f"🔗 Chain: {CHAIN_FILTER.upper()}\n"
@@ -855,10 +955,20 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "❓ *Help*\n\n"
             "Use the *Search Token* button or `/search` to look up any token.\n"
             "After searching, you can choose to track it and set alert preferences.\n\n"
-            "*Global Alerts* — optional broadcast of new tokens that pass the filter.\n"
+            "*New Token Alerts* — optional broadcast of new tokens that pass the filter.\n"
             "*Tracked Tokens* — your personal watchlist with custom alert settings."
         )
         await query.edit_message_text(text, parse_mode="Markdown", reply_markup=main_menu_for(cid))
+        return
+
+    if data == "contact_prompt":
+        db.set_state(cid, "awaiting_feedback")
+        db.save()
+        await query.edit_message_text(
+            "💬 *Contact Developer*\n\nSend your message in the next reply.\n\n"
+            "Use this for feedback, bug reports, or feature requests.",
+            parse_mode="Markdown",
+        )
         return
 
     if data == "back_main":
@@ -962,7 +1072,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ─────────────────────────────────────────────
-# BACKGROUND JOB — global new token alerts
+# BACKGROUND JOB — new token alerts
 # ─────────────────────────────────────────────
 
 async def check_new(context: ContextTypes.DEFAULT_TYPE):
@@ -1017,7 +1127,7 @@ async def check_new(context: ContextTypes.DEFAULT_TYPE):
         alerts_built.append(msg)
 
     alerts_built = alerts_built[:MAX_ALERTS_PER_CYCLE]
-    subscribers = db.global_alert_subscribers()
+    subscribers = db.token_alert_subscribers()
 
     if alerts_built and subscribers:
         for msg in alerts_built:
@@ -1030,7 +1140,7 @@ async def check_new(context: ContextTypes.DEFAULT_TYPE):
                     log.warning(f"Send error to {cid}: {e}")
                     if "blocked" in err or "chat not found" in err:
                         db.get_user(cid)["blocked"] = True
-                        db.get_user(cid)["global_alerts"] = False
+                        db.get_user(cid)["token_alerts"] = False
 
     db.save()
 
@@ -1227,6 +1337,8 @@ app.add_handler(CommandHandler("status", status_command))
 app.add_handler(CommandHandler("analytics", analytics_command))
 app.add_handler(CommandHandler("search", search_command))
 app.add_handler(CommandHandler("mytokens", mytokens_command))
+app.add_handler(CommandHandler("contact", contact_command))
+app.add_handler(CommandHandler("reply", reply_command))
 app.add_handler(CommandHandler("myid", myid_command))
 
 app.add_handler(CommandHandler("analyze", analyze_command))
