@@ -1497,5 +1497,6 @@ log.info("Bot V2 running...")
 log.info("Job queue available: %s", bool(app.job_queue))
 log.info("Bot V2 production file running...")
 log.info("=== MANAGE ALERTS INSIDE MY TOKENS ONLY ===")
+log.info("=== MANAGE ALERTS INSIDE MY TOKENS ONLY V2 ===")
 app.run_polling()
 
