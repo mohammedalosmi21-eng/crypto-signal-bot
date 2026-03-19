@@ -502,7 +502,7 @@ def track_prompt_menu(token_key: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton("✅ Track this token", callback_data=f"track_add:{token_key}"),
-            InlineKeyboardButton("❌ No thanks", callback_data="track_skip"),
+            InlineKeyboardButton("❌ No thanks", callback_data=f"track_skip:{token_key}"),
         ]
     ])
 
@@ -524,6 +524,14 @@ def alert_prefs_menu(chat_id: int, token_key: str) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(label("unusual_activity", "Unusual Activity"), callback_data=f"pref:{token_key}:unusual_activity")],
         [InlineKeyboardButton("🗑 Stop Tracking", callback_data=f"track_remove:{token_key}")],
         [InlineKeyboardButton("⬅️ Back", callback_data="my_tokens")],
+    ])
+
+
+def tracked_token_action_menu(token_key: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⚙️ Manage Alerts", callback_data=f"token_detail:{token_key}")],
+        [InlineKeyboardButton("🗑 Remove from List", callback_data=f"track_remove:{token_key}")],
+        [InlineKeyboardButton("⬅️ Main Menu", callback_data="back_main")],
     ])
 
 
@@ -1016,9 +1024,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         token_key = data.split(":", 1)[1]
         pending = context.user_data.get("pending_track", {})
 
-        symbol = pending.get("symbol", "???")
-        name = pending.get("name", "???")
-        chain = pending.get("chain", "unknown")
+        existing_entry = db.get_tracked_token(cid, token_key) or {}
+        symbol = pending.get("symbol") or existing_entry.get("symbol") or "???"
+        name = pending.get("name") or existing_entry.get("name") or "???"
+        chain = pending.get("chain") or existing_entry.get("chain") or "unknown"
 
         already_exists = db.get_tracked_token(cid, token_key) is not None
         db.track_token(cid, token_key, symbol, name, chain)
@@ -1028,36 +1037,61 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         safe_symbol = escape_markdown(symbol, version=1)
 
         if already_exists:
-            text = (
+            confirmation_text = (
                 f"ℹ️ *{safe_symbol}* is already in your tracked list.\n\n"
                 "You can manage alerts or remove it below:"
             )
+            answer_text = "Already tracked ℹ️"
         else:
-            text = (
+            confirmation_text = (
                 f"✅ *{safe_symbol}* was added to your tracked list.\n\n"
                 "You can manage alerts or remove it below:"
             )
+            answer_text = "Added to list ✅"
 
-        await query.answer("Token added ✅" if not already_exists else "Already tracked ℹ️")
+        try:
+            await query.answer(answer_text, show_alert=True)
+        except Exception:
+            await query.answer(answer_text)
 
         try:
             await query.edit_message_text(
-                text,
+                f"✅ *{safe_symbol}* saved.",
                 parse_mode="Markdown",
-                reply_markup=alert_prefs_menu(cid, token_key),
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("⬅️ Main Menu", callback_data="back_main")]
+                ]),
             )
         except Exception as e:
-            log.warning(f"track_add: edit_message_text failed for {cid}/{token_key}: {e}")
-            await context.bot.send_message(
-                chat_id=cid,
-                text=text,
-                parse_mode="Markdown",
-                reply_markup=alert_prefs_menu(cid, token_key),
-            )
+            log.warning(f"track_add: could not update original prompt for {cid}/{token_key}: {e}")
+
+        await context.bot.send_message(
+            chat_id=cid,
+            text=confirmation_text,
+            parse_mode="Markdown",
+            reply_markup=tracked_token_action_menu(token_key),
+        )
         return
 
-    if data == "track_skip":
-        await query.edit_message_text("👍 No problem. Search another token anytime.", reply_markup=main_menu_for(cid))
+    if data.startswith("track_skip:"):
+        token_key = data.split(":", 1)[1]
+        entry = db.get_tracked_token(cid, token_key)
+
+        if entry:
+            safe_symbol = escape_markdown(entry.get("symbol", token_key), version=1)
+            await query.answer("Token is already tracked ℹ️", show_alert=True)
+            await query.edit_message_text(
+                f"ℹ️ *{safe_symbol}* is already in your tracked list.\n\n"
+                "You can manage alerts or remove it below:",
+                parse_mode="Markdown",
+                reply_markup=tracked_token_action_menu(token_key),
+            )
+        else:
+            context.user_data.pop("pending_track", None)
+            await query.edit_message_text(
+                "👍 No problem. This token was not added to your tracked list.",
+                reply_markup=main_menu_for(cid),
+            )
         return
 
     if data.startswith("track_remove:"):
@@ -1066,8 +1100,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         symbol = entry["symbol"] if entry else token_key
         db.untrack_token(cid, token_key)
         db.save()
+        context.user_data.pop("pending_track", None)
         await query.edit_message_text(
-            f"🗑 *{escape_markdown(symbol, version=1)}* removed from tracking.",
+            f"🗑 *{escape_markdown(symbol, version=1)}* was removed from your tracked list.",
             parse_mode="Markdown",
             reply_markup=main_menu_for(cid),
         )
@@ -1393,4 +1428,3 @@ log.info("Bot V2 running...")
 log.info("Job queue available: %s", bool(app.job_queue))
 log.info("Bot V2 production file running...")
 app.run_polling()
-
