@@ -529,8 +529,8 @@ def alert_prefs_menu(chat_id: int, token_key: str) -> InlineKeyboardMarkup:
 
 def tracked_token_action_menu(token_key: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("⚙️ Manage Alerts", callback_data=f"token_detail:{token_key}")],
         [InlineKeyboardButton("🗑 Remove from List", callback_data=f"track_remove:{token_key}")],
+        [InlineKeyboardButton("📋 My Tracked Tokens", callback_data="my_tokens")],
         [InlineKeyboardButton("⬅️ Main Menu", callback_data="back_main")],
     ])
 
@@ -695,7 +695,7 @@ async def mytokens_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    text = "📋 *Your Tracked Tokens*\nTap a token to manage alert preferences or remove it.\n"
+    text = "📋 *Your Tracked Tokens*\nTap a token to manage alert preferences.\n"
     await update.message.reply_text(text, parse_mode="Markdown", reply_markup=my_tokens_menu(cid))
 
 
@@ -897,10 +897,10 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     else:
         await update.message.reply_text(
-            f"✅ You're already tracking *{escape_markdown(symbol, version=1)}*.",
+            f"✅ You're already tracking *{escape_markdown(symbol, version=1)}*.\n\nManage alerts from *My Tracked Tokens*.",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton(f"⚙️ Manage {symbol} alerts", callback_data=f"token_detail:{token_key}")],
+                [InlineKeyboardButton("📋 My Tracked Tokens", callback_data="my_tokens")],
                 [InlineKeyboardButton("⬅️ Main Menu", callback_data="back_main")],
             ]),
         )
@@ -999,7 +999,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         else:
             await query.edit_message_text(
-                "📋 *Your Tracked Tokens*\nTap a token to manage its alert settings or remove it.",
+                "📋 *Your Tracked Tokens*\nTap a token to manage its alert settings.",
                 parse_mode="Markdown",
                 reply_markup=my_tokens_menu(cid),
             )
@@ -1071,13 +1071,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if already_exists:
             confirmation_text = (
                 f"ℹ️ *{safe_symbol}* is already in your tracked list.\n\n"
-                "You can manage alerts or remove it below:"
+                "Manage alerts from *My Tracked Tokens*, or remove it below:"
             )
             answer_text = "Already tracked ℹ️"
         else:
             confirmation_text = (
                 f"✅ *{safe_symbol}* was added to your tracked list.\n\n"
-                "You can manage alerts or remove it below:"
+                "Manage alerts any time from *My Tracked Tokens*, or remove it below:"
             )
             answer_text = "Added to list ✅"
 
@@ -1114,7 +1114,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer("Token is already tracked ℹ️", show_alert=True)
             await query.edit_message_text(
                 f"ℹ️ *{safe_symbol}* is already in your tracked list.\n\n"
-                "You can manage alerts or remove it below:",
+                "Manage alerts from *My Tracked Tokens*, or remove it below:",
                 parse_mode="Markdown",
                 reply_markup=tracked_token_action_menu(token_key),
             )
@@ -1496,4 +1496,6 @@ log.info("=== DEPLOY MARKER V3 ===")
 log.info("Bot V2 running...")
 log.info("Job queue available: %s", bool(app.job_queue))
 log.info("Bot V2 production file running...")
+log.info("=== MANAGE ALERTS INSIDE MY TOKENS ONLY ===")
 app.run_polling()
+
