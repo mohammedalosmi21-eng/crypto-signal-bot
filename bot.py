@@ -29,6 +29,7 @@ import json
 import os
 import logging
 import asyncio
+from typing import Optional
 
 # ─────────────────────────────────────────────
 # CONFIG
@@ -43,6 +44,14 @@ MIN_VOLUME = 5000
 CHECK_INTERVAL = 180
 MAX_ALERTS_PER_CYCLE = 1
 DATA_FILE = "bot_data.json"
+BSCSCAN_API_KEY = os.getenv("BSCSCAN_API_KEY", "")
+SMART_MONEY_CHECK_INTERVAL = 180
+SMART_MONEY_MIN_TOKEN_VALUE_USD = 1000.0
+SMART_MONEY_WALLETS = [
+    {"label": "Wallet 1", "address": "0x0000000000000000000000000000000000000001"},
+    {"label": "Wallet 2", "address": "0x0000000000000000000000000000000000000002"},
+    {"label": "Wallet 3", "address": "0x0000000000000000000000000000000000000003"},
+]
 
 # Per-token alert thresholds
 PRICE_CHANGE_ALERT_PCT = 10.0
@@ -73,6 +82,7 @@ def default_user(chat_id: int) -> dict:
         "state": "idle",
         "last_search_query": None,
         "token_alerts": False,
+        "smart_money_alerts": False,
         "blocked": False,
         "first_seen": _now(),
         "last_active": _now(),
@@ -120,6 +130,8 @@ class BotData:
         self.analyze_count: int = 0
         self.last_alert_message: str = "No alerts yet"
         self.last_check_time: str = "Not started yet"
+        self.smart_money_last_check_time: str = "Not started yet"
+        self.smart_money_seen_hashes: dict = {}
 
     # ── user helpers ──────────────────────────
 
@@ -155,6 +167,18 @@ class BotData:
         return [
             int(uid) for uid, u in self.users.items()
             if u.get("token_alerts") and not u.get("blocked")
+        ]
+
+    def smart_money_alerts_enabled(self, chat_id: int) -> bool:
+        return self.get_user(chat_id).get("smart_money_alerts", False)
+
+    def set_smart_money_alerts(self, chat_id: int, enabled: bool):
+        self.get_user(chat_id)["smart_money_alerts"] = enabled
+
+    def smart_money_subscribers(self) -> list:
+        return [
+            int(uid) for uid, u in self.users.items()
+            if u.get("smart_money_alerts") and not u.get("blocked")
         ]
 
     # ── tracked token helpers ─────────────────
@@ -241,12 +265,16 @@ class BotData:
                 for u in self.users.values():
                     if "global_alerts" in u and "token_alerts" not in u:
                         u["token_alerts"] = u.pop("global_alerts")
+                    if "smart_money_alerts" not in u:
+                        u["smart_money_alerts"] = False
                 self.tracked_tokens = raw.get("tracked_tokens", {})
                 self.search_history = raw.get("search_history", [])
                 self.search_counts = raw.get("search_counts", {})
                 self.analyze_count = raw.get("analyze_count", 0)
                 self.last_alert_message = raw.get("last_alert_message", "No alerts yet")
                 self.last_check_time = raw.get("last_check_time", "Not started yet")
+                self.smart_money_last_check_time = raw.get("smart_money_last_check_time", "Not started yet")
+                self.smart_money_seen_hashes = raw.get("smart_money_seen_hashes", {})
                 seen_tokens = set(raw.get("seen_tokens", []))
             else:
                 log.info("Migrating V1 data to V2 format...")
@@ -271,6 +299,8 @@ class BotData:
                 self.search_counts = raw.get("search_counts", {})
                 self.analyze_count = raw.get("analyze_count", 0)
                 self.last_alert_message = raw.get("last_alert_message", "No alerts yet")
+                self.smart_money_last_check_time = raw.get("smart_money_last_check_time", "Not started yet")
+                self.smart_money_seen_hashes = raw.get("smart_money_seen_hashes", {})
                 seen_tokens = set(raw.get("seen_tokens", []))
                 log.info("V1 migration complete.")
 
@@ -288,6 +318,8 @@ class BotData:
                     "analyze_count": self.analyze_count,
                     "last_alert_message": self.last_alert_message,
                     "last_check_time": self.last_check_time,
+                    "smart_money_last_check_time": self.smart_money_last_check_time,
+                    "smart_money_seen_hashes": self.smart_money_seen_hashes,
                     "seen_tokens": list(seen_tokens),
                 }, f, ensure_ascii=False, indent=2)
         except Exception as e:
@@ -493,6 +525,9 @@ def main_menu_for(chat_id: int) -> InlineKeyboardMarkup:
     enabled = db.token_alerts_enabled(chat_id)
     toggle_label = "🔥 New Token Alerts: ON ✅" if enabled else "🔥 New Token Alerts: OFF ❌"
     toggle_data = "token_alerts_off" if enabled else "token_alerts_on"
+    sm_enabled = db.smart_money_alerts_enabled(chat_id)
+    sm_label = "🐋 Smart Money Alerts: ON ✅" if sm_enabled else "🐋 Smart Money Alerts: OFF ❌"
+    sm_data = "smart_money_off" if sm_enabled else "smart_money_on"
 
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🔍 Search Token", callback_data="search_prompt")],
@@ -501,6 +536,7 @@ def main_menu_for(chat_id: int) -> InlineKeyboardMarkup:
             InlineKeyboardButton("📊 Status", callback_data="status"),
         ],
         [InlineKeyboardButton(toggle_label, callback_data=toggle_data)],
+        [InlineKeyboardButton(sm_label, callback_data=sm_data)],
         [InlineKeyboardButton("💬 Contact Developer", callback_data="contact_prompt")],
         [InlineKeyboardButton("❓ Help", callback_data="help")],
     ])
@@ -546,9 +582,20 @@ def alert_prefs_menu(chat_id: int, token_key: str) -> InlineKeyboardMarkup:
 
 def tracked_token_action_menu(token_key: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🗑 Remove from List", callback_data=f"track_remove:{token_key}")],
+        [InlineKeyboardButton("⚙️ Manage Alerts", callback_data=f"manage_alerts:{token_key}")],
+        [InlineKeyboardButton("🗑 Remove from List", callback_data=f"track_remove_confirm:{token_key}")],
         [InlineKeyboardButton("📋 My Tracked Tokens", callback_data="my_tokens")],
         [InlineKeyboardButton("⬅️ Main Menu", callback_data="back_main")],
+    ])
+
+
+def token_delete_confirm_menu(token_key: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⚙️ Manage Alerts", callback_data=f"manage_alerts:{token_key}")],
+        [
+            InlineKeyboardButton("✅ Yes, Delete", callback_data=f"track_remove:{token_key}"),
+            InlineKeyboardButton("❌ No", callback_data="back_main"),
+        ],
     ])
 
 
@@ -567,15 +614,133 @@ def my_tokens_menu(chat_id: int) -> InlineKeyboardMarkup:
 
 
 # ─────────────────────────────────────────────
-# SMART MONEY PLACEHOLDER
+# SMART MONEY LAYER (BSC via BscScan)
 # ─────────────────────────────────────────────
 
+def normalize_address(addr: str) -> str:
+    return (addr or "").strip().lower()
+
+
+def smart_wallets() -> list:
+    cleaned = []
+    for item in SMART_MONEY_WALLETS:
+        addr = normalize_address(item.get("address", ""))
+        if addr.startswith("0x") and len(addr) == 42:
+            cleaned.append({"label": item.get("label", addr[-6:]), "address": addr})
+    return cleaned
+
+
+def bscscan_get(params: dict, timeout: int = 20):
+    if not BSCSCAN_API_KEY:
+        return None
+    full_params = dict(params)
+    full_params["apikey"] = BSCSCAN_API_KEY
+    try:
+        r = requests.get("https://api.bscscan.com/api", params=full_params, timeout=timeout)
+        r.raise_for_status()
+        data = r.json()
+        status = str(data.get("status", ""))
+        message = str(data.get("message", ""))
+        result = data.get("result")
+        if status == "1" and isinstance(result, list):
+            return result
+        if isinstance(result, str) and "No transactions found" in result:
+            return []
+        if message.upper() == "OK" and isinstance(result, list):
+            return result
+        log.warning(f"bscscan_get: unexpected response: {data}")
+    except Exception as e:
+        log.warning(f"bscscan_get failed: {e}")
+    return None
+
+
+def get_wallet_token_transfers(address: str, offset: int = 10) -> list:
+    return bscscan_get({
+        "module": "account",
+        "action": "tokentx",
+        "address": address,
+        "sort": "desc",
+        "page": 1,
+        "offset": offset,
+    }) or []
+
+
+def infer_tx_side(wallet_address: str, tx: dict) -> str:
+    wallet = normalize_address(wallet_address)
+    from_addr = normalize_address(tx.get("from", ""))
+    to_addr = normalize_address(tx.get("to", ""))
+    if to_addr == wallet and from_addr != wallet:
+        return "buy"
+    if from_addr == wallet and to_addr != wallet:
+        return "sell"
+    return "transfer"
+
+
+def tx_token_amount(tx: dict) -> float:
+    try:
+        value = float(tx.get("value") or 0)
+        decimals = int(tx.get("tokenDecimal") or 0)
+        if decimals >= 0:
+            return value / (10 ** decimals) if decimals <= 30 else 0.0
+    except Exception:
+        pass
+    return 0.0
+
+
+def approximate_tx_usd_value(tx: dict) -> float:
+    amount = tx_token_amount(tx)
+    token_symbol = str(tx.get("tokenSymbol") or "").upper()
+    if token_symbol in {"USDT", "USDC", "BUSD", "DAI"}:
+        return amount
+    return 0.0
+
+
+def build_smart_money_alert(wallet_label: str, wallet_address: str, tx: dict) -> Optional[str]:
+    side = infer_tx_side(wallet_address, tx)
+    if side == "transfer":
+        return None
+
+    token_symbol = escape_markdown(str(tx.get("tokenSymbol") or "?"), version=1)
+    token_name = escape_markdown(str(tx.get("tokenName") or "?"), version=1)
+    contract = str(tx.get("contractAddress") or "")
+    amount = tx_token_amount(tx)
+    approx_usd = approximate_tx_usd_value(tx)
+    if approx_usd and approx_usd < SMART_MONEY_MIN_TOKEN_VALUE_USD:
+        return None
+
+    side_label = "🟢 BUY" if side == "buy" else "🔴 SELL"
+    wallet_label_safe = escape_markdown(wallet_label, version=1)
+    wallet_short = escape_markdown(wallet_address[:6] + "..." + wallet_address[-4:], version=1)
+    amount_text = f"{amount:,.4f}".rstrip("0").rstrip(".") if amount else "N/A"
+    usd_text = f"~${fmt_money(approx_usd)}" if approx_usd > 0 else "N/A"
+    bscscan_link = f"https://bscscan.com/tx/{tx.get('hash','')}" if tx.get("hash") else ""
+    token_link = f"https://dexscreener.com/bsc/{contract}" if contract else ""
+    links = []
+    if token_link:
+        links.append(f"[Chart]({token_link})")
+    if bscscan_link:
+        links.append(f"[Tx]({bscscan_link})")
+    links_line = " | ".join(links)
+    links_line = f"\n\n{links_line}" if links_line else ""
+
+    return (
+        f"🐋 *Smart Money Alert*\n\n"
+        f"Wallet: *{wallet_label_safe}* (`{wallet_short}`)\n"
+        f"Action: *{side_label}*\n"
+        f"Token: *{token_symbol}* — {token_name}\n"
+        f"Amount: `{escape_markdown(amount_text, version=1)}`\n"
+        f"Approx Value: `{escape_markdown(usd_text, version=1)}`\n"
+        f"Chain: *BSC*"
+        f"{links_line}"
+    )
+
+
 async def smart_money_check(token_key: str) -> dict:
+    # kept for compatibility with older code paths
     return {
-        "status": "placeholder",
-        "whale_activity": None,
-        "known_traders": [],
-        "confidence": 0,
+        "status": "bscscan_ready" if BSCSCAN_API_KEY else "disabled",
+        "tracked_wallets": len(smart_wallets()),
+        "confidence": 60 if BSCSCAN_API_KEY else 0,
     }
 
 
@@ -715,6 +880,7 @@ async def analytics_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     global_subs = len(db.token_alert_subscribers())
+    smart_money_subs = len(db.smart_money_subscribers())
     total_users = len(db.users)
     blocked_count = sum(1 for u in db.users.values() if u.get("blocked"))
     tracked_total = len(db.tracked_tokens)
@@ -1038,6 +1204,32 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(cid, text, parse_mode="Markdown", reply_markup=main_menu_for(cid))
         return
 
+    if data == "smart_money_on":
+        db.set_smart_money_alerts(cid, True)
+        db.save()
+        text = (
+            "🐋 *Smart Money Alerts Enabled*\n\n"
+            "You'll receive alerts when the configured smart-money wallets buy or sell on BSC."
+        )
+        try:
+            await query.edit_message_text(text, parse_mode="Markdown", reply_markup=main_menu_for(cid))
+        except Exception:
+            await context.bot.send_message(cid, text, parse_mode="Markdown", reply_markup=main_menu_for(cid))
+        return
+
+    if data == "smart_money_off":
+        db.set_smart_money_alerts(cid, False)
+        db.save()
+        text = (
+            "🐋 *Smart Money Alerts Disabled*\n\n"
+            "You won't receive smart-money wallet alerts."
+        )
+        try:
+            await query.edit_message_text(text, parse_mode="Markdown", reply_markup=main_menu_for(cid))
+        except Exception:
+            await context.bot.send_message(cid, text, parse_mode="Markdown", reply_markup=main_menu_for(cid))
+        return
+
     if data == "status":
         global_on = "Enabled ✅" if db.token_alerts_enabled(cid) else "Disabled ❌"
         tracked_count = len(db.get_tracked(cid))
@@ -1063,6 +1255,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Use the *Search Token* button or `/search` to look up any token.\n"
             "After searching, you can choose to track it and set alert preferences.\n\n"
             "*New Token Alerts* — optional broadcast of new tokens that pass the filter.\n"
+            "*Smart Money Alerts* — optional alerts from tracked smart-money wallets on BSC.\n"
             "*Tracked Tokens* — your personal watchlist with custom alert settings."
         )
         try:
@@ -1126,17 +1319,55 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("token_detail|"):
         token_key = data.split("|", 1)[1]
         log.info(f"token_detail: cid={cid}, token_key={token_key!r}")
+        entry = db.get_tracked_token(cid, token_key)
+        if not entry:
+            await context.bot.send_message(
+                chat_id=cid,
+                text="⚠️ Token not found in your tracked list.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("📋 My Tracked Tokens", callback_data="my_tokens")],
+                    [InlineKeyboardButton("⬅️ Main Menu", callback_data="back_main")],
+                ]),
+            )
+            return
 
-        # Primary response — always runs, never silently skipped
+        symbol_safe = escape_markdown(str(entry.get("symbol", "?")), version=1)
+        chain_safe = escape_markdown(str(entry.get("chain", "?")).upper(), version=1)
+        text = (
+            f"📌 *{symbol_safe}* — {chain_safe}\n\n"
+            "Do you want to delete this token from your tracked list?\n\n"
+            "You can also open alert settings before deciding."
+        )
+
+        try:
+            await query.edit_message_text(text, parse_mode="Markdown", reply_markup=token_delete_confirm_menu(token_key))
+        except Exception:
+            await context.bot.send_message(cid, text, parse_mode="Markdown", reply_markup=token_delete_confirm_menu(token_key))
+        return
+
+    if data.startswith("manage_alerts:"):
+        token_key = data.split(":", 1)[1]
         delivered = await _send_alert_settings(context, cid, token_key)
-
         if delivered:
-            # Best-effort: try to clean up the "My Tracked Tokens" list message.
-            # If this fails for any reason, the user already has their response.
             try:
                 await query.edit_message_reply_markup(reply_markup=None)
             except Exception as e:
-                log.debug(f"token_detail: could not remove list keyboard (non-fatal): {e}")
+                log.debug(f"manage_alerts: could not remove previous keyboard (non-fatal): {e}")
+        return
+
+    if data.startswith("track_remove_confirm:"):
+        token_key = data.split(":", 1)[1]
+        entry = db.get_tracked_token(cid, token_key)
+        symbol_safe = escape_markdown(str((entry or {}).get("symbol", token_key)), version=1)
+        text = (
+            f"🗑 *Delete {symbol_safe}?*\n\n"
+            "Press *Yes* to remove it from your tracked list.\n"
+            "Press *No* to return to the main menu."
+        )
+        try:
+            await query.edit_message_text(text, parse_mode="Markdown", reply_markup=token_delete_confirm_menu(token_key))
+        except Exception:
+            await context.bot.send_message(cid, text, parse_mode="Markdown", reply_markup=token_delete_confirm_menu(token_key))
         return
 
     # ── track_add ──────────────────────────────────────────────────────────
@@ -1560,6 +1791,66 @@ async def check_tracked_tokens(context: ContextTypes.DEFAULT_TYPE):
 
 
 # ─────────────────────────────────────────────
+# BACKGROUND JOB — smart money alerts
+# ─────────────────────────────────────────────
+
+async def check_smart_money(context: ContextTypes.DEFAULT_TYPE):
+    db.smart_money_last_check_time = _now()
+
+    subscribers = db.smart_money_subscribers()
+    wallets = smart_wallets()
+    if not subscribers or not wallets or not BSCSCAN_API_KEY:
+        db.save()
+        return
+
+    alerts = []
+
+    for wallet in wallets:
+        wallet_addr = wallet["address"]
+        wallet_label = wallet["label"]
+        seen_hashes = set(db.smart_money_seen_hashes.get(wallet_addr, []))
+        txs = get_wallet_token_transfers(wallet_addr, offset=10)
+        if txs is None:
+            continue
+
+        fresh_seen = set(seen_hashes)
+        wallet_alerts = []
+        for tx in txs:
+            tx_hash = str(tx.get("hash") or "").lower()
+            if not tx_hash:
+                continue
+            if tx_hash in seen_hashes:
+                continue
+            fresh_seen.add(tx_hash)
+            message = build_smart_money_alert(wallet_label, wallet_addr, tx)
+            if message:
+                wallet_alerts.append((int(tx.get("timeStamp") or 0), message))
+
+        wallet_alerts.sort(key=lambda x: x[0])
+        alerts.extend([msg for _, msg in wallet_alerts])
+        db.smart_money_seen_hashes[wallet_addr] = list(fresh_seen)[-200:]
+
+    for msg in alerts[:10]:
+        for cid in subscribers:
+            try:
+                await context.bot.send_message(
+                    chat_id=cid,
+                    text=msg,
+                    parse_mode="Markdown",
+                    disable_web_page_preview=True,
+                )
+            except Exception as e:
+                err = str(e).lower()
+                log.warning(f"check_smart_money: failed to send alert to {cid}: {e}")
+                if "blocked" in err or "chat not found" in err:
+                    user = db.get_user(cid)
+                    user["blocked"] = True
+                    user["smart_money_alerts"] = False
+
+    db.save()
+
+
+# ─────────────────────────────────────────────
 # APP SETUP & RUN
 # ─────────────────────────────────────────────
 
@@ -1587,6 +1878,7 @@ try:
     if app.job_queue:
         app.job_queue.run_repeating(check_new, interval=CHECK_INTERVAL, first=10)
         app.job_queue.run_repeating(check_tracked_tokens, interval=300, first=30)
+        app.job_queue.run_repeating(check_smart_money, interval=SMART_MONEY_CHECK_INTERVAL, first=45)
         log.info("Job queue started.")
     else:
         log.warning("Job queue NOT available — background jobs DISABLED")
