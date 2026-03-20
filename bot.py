@@ -61,6 +61,13 @@ TRACKED_BATCH_SLEEP_EVERY = 10
 TRACKED_BATCH_SLEEP_SECONDS = 2
 TRACKED_CHECK_MIN_BASELINE_SECONDS = 240
 
+# Market manipulation detection thresholds
+MANIPULATION_PRICE_SPIKE_PCT = 8.0
+MANIPULATION_VOLUME_SPIKE_RATIO = 3.0
+MANIPULATION_MIN_LIQUIDITY_USD = 10000.0
+MANIPULATION_MIN_VOLUME_USD = 25000.0
+MANIPULATION_BUY_SELL_RATIO = 4.0
+
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
@@ -83,6 +90,7 @@ def default_user(chat_id: int) -> dict:
         "last_search_query": None,
         "token_alerts": False,
         "smart_money_alerts": False,
+        "manipulation_alerts": False,
         "blocked": False,
         "first_seen": _now(),
         "last_active": _now(),
@@ -131,6 +139,7 @@ class BotData:
         self.last_alert_message: str = "No alerts yet"
         self.last_check_time: str = "Not started yet"
         self.smart_money_last_check_time: str = "Not started yet"
+        self.manipulation_last_check_time: str = "Not started yet"
         self.smart_money_seen_hashes: dict = {}
 
     # ── user helpers ──────────────────────────
@@ -179,6 +188,18 @@ class BotData:
         return [
             int(uid) for uid, u in self.users.items()
             if u.get("smart_money_alerts") and not u.get("blocked")
+        ]
+
+    def manipulation_alerts_enabled(self, chat_id: int) -> bool:
+        return self.get_user(chat_id).get("manipulation_alerts", False)
+
+    def set_manipulation_alerts(self, chat_id: int, enabled: bool):
+        self.get_user(chat_id)["manipulation_alerts"] = enabled
+
+    def manipulation_subscribers(self) -> list:
+        return [
+            int(uid) for uid, u in self.users.items()
+            if u.get("manipulation_alerts") and not u.get("blocked")
         ]
 
     # ── tracked token helpers ─────────────────
@@ -267,6 +288,8 @@ class BotData:
                         u["token_alerts"] = u.pop("global_alerts")
                     if "smart_money_alerts" not in u:
                         u["smart_money_alerts"] = False
+                    if "manipulation_alerts" not in u:
+                        u["manipulation_alerts"] = False
                 self.tracked_tokens = raw.get("tracked_tokens", {})
                 self.search_history = raw.get("search_history", [])
                 self.search_counts = raw.get("search_counts", {})
@@ -274,6 +297,7 @@ class BotData:
                 self.last_alert_message = raw.get("last_alert_message", "No alerts yet")
                 self.last_check_time = raw.get("last_check_time", "Not started yet")
                 self.smart_money_last_check_time = raw.get("smart_money_last_check_time", "Not started yet")
+                self.manipulation_last_check_time = raw.get("manipulation_last_check_time", "Not started yet")
                 self.smart_money_seen_hashes = raw.get("smart_money_seen_hashes", {})
                 seen_tokens = set(raw.get("seen_tokens", []))
             else:
@@ -300,6 +324,7 @@ class BotData:
                 self.analyze_count = raw.get("analyze_count", 0)
                 self.last_alert_message = raw.get("last_alert_message", "No alerts yet")
                 self.smart_money_last_check_time = raw.get("smart_money_last_check_time", "Not started yet")
+                self.manipulation_last_check_time = raw.get("manipulation_last_check_time", "Not started yet")
                 self.smart_money_seen_hashes = raw.get("smart_money_seen_hashes", {})
                 seen_tokens = set(raw.get("seen_tokens", []))
                 log.info("V1 migration complete.")
@@ -319,6 +344,7 @@ class BotData:
                     "last_alert_message": self.last_alert_message,
                     "last_check_time": self.last_check_time,
                     "smart_money_last_check_time": self.smart_money_last_check_time,
+                    "manipulation_last_check_time": self.manipulation_last_check_time,
                     "smart_money_seen_hashes": self.smart_money_seen_hashes,
                     "seen_tokens": list(seen_tokens),
                 }, f, ensure_ascii=False, indent=2)
@@ -528,6 +554,9 @@ def main_menu_for(chat_id: int) -> InlineKeyboardMarkup:
     sm_enabled = db.smart_money_alerts_enabled(chat_id)
     sm_label = "🐋 Smart Money Alerts: ON ✅" if sm_enabled else "🐋 Smart Money Alerts: OFF ❌"
     sm_data = "smart_money_off" if sm_enabled else "smart_money_on"
+    manip_enabled = db.manipulation_alerts_enabled(chat_id)
+    manip_label = "⚠️ Manipulation Alerts: ON ✅" if manip_enabled else "⚠️ Manipulation Alerts: OFF ❌"
+    manip_data = "manipulation_off" if manip_enabled else "manipulation_on"
 
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🔍 Search Token", callback_data="search_prompt")],
@@ -537,6 +566,7 @@ def main_menu_for(chat_id: int) -> InlineKeyboardMarkup:
         ],
         [InlineKeyboardButton(toggle_label, callback_data=toggle_data)],
         [InlineKeyboardButton(sm_label, callback_data=sm_data)],
+        [InlineKeyboardButton(manip_label, callback_data=manip_data)],
         [InlineKeyboardButton("💬 Contact Developer", callback_data="contact_prompt")],
         [InlineKeyboardButton("❓ Help", callback_data="help")],
     ])
@@ -745,6 +775,57 @@ async def smart_money_check(token_key: str) -> dict:
 
 
 # ─────────────────────────────────────────────
+# MANIPULATION DETECTION LAYER
+# ─────────────────────────────────────────────
+
+def detect_manipulation_signal(last_price: float, current_price: float, last_volume: float, current_volume: float, current_liquidity: float, current_buys: int, current_sells: int) -> Optional[dict]:
+    if last_price <= 0 or last_volume <= 0:
+        return None
+    if current_liquidity < MANIPULATION_MIN_LIQUIDITY_USD or current_volume < MANIPULATION_MIN_VOLUME_USD:
+        return None
+
+    price_pct = ((current_price - last_price) / last_price) * 100 if last_price > 0 else 0.0
+    volume_ratio = current_volume / last_volume if last_volume > 0 else 0.0
+    buy_sell_ratio = current_buys / max(current_sells, 1)
+
+    if price_pct < MANIPULATION_PRICE_SPIKE_PCT:
+        return None
+    if volume_ratio < MANIPULATION_VOLUME_SPIKE_RATIO:
+        return None
+    if buy_sell_ratio < MANIPULATION_BUY_SELL_RATIO:
+        return None
+
+    risk_score = 55
+    risk_score += min(20, int((price_pct - MANIPULATION_PRICE_SPIKE_PCT) * 1.5))
+    risk_score += min(15, int((volume_ratio - MANIPULATION_VOLUME_SPIKE_RATIO) * 5))
+    if current_sells == 0:
+        risk_score += 10
+    risk_score = min(risk_score, 99)
+
+    return {
+        "price_pct": price_pct,
+        "volume_ratio": volume_ratio,
+        "buy_sell_ratio": buy_sell_ratio,
+        "risk_score": risk_score,
+    }
+
+
+def build_manipulation_alert(symbol: str, chain_display: str, dex_url: str, signal: dict, last_price: float, current_price: float, last_volume: float, current_volume: float, current_buys: int, current_sells: int) -> str:
+    footer = f"\n\n[View on Dexscreener]({dex_url})" if dex_url else ""
+    return (
+        f"⚠️ *Market Manipulation Warning — {symbol}*\n\n"
+        f"🔗 *Chain:* {chain_display}\n"
+        f"📈 *Price Spike:* +{signal['price_pct']:.1f}%  `${fmt_price(last_price)}` → `${fmt_price(current_price)}`\n"
+        f"🔥 *Volume Spike:* {signal['volume_ratio']:.1f}x  `${fmt_money(last_volume)}` → `${fmt_money(current_volume)}`\n"
+        f"🧪 *Buy Pressure:* {current_buys} buys vs {current_sells} sells\n"
+        f"🎯 *Risk Score:* {signal['risk_score']}/100\n\n"
+        f"*Interpretation:* sudden price and volume acceleration with concentrated buy pressure.\n"
+        f"*Recommendation:* avoid chasing the move until the token stabilizes."
+        f"{footer}"
+    )
+
+
+# ─────────────────────────────────────────────
 # INTERNAL HELPER — send alert settings message
 # ─────────────────────────────────────────────
 
@@ -860,19 +941,22 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     new_tokens_on = "Enabled ✅" if db.token_alerts_enabled(cid) else "Disabled ❌"
     smart_money_on = "Enabled ✅" if db.smart_money_alerts_enabled(cid) else "Disabled ❌"
+    manipulation_on = "Enabled ✅" if db.manipulation_alerts_enabled(cid) else "Disabled ❌"
     tracked_count = len(db.get_tracked(cid))
 
     text = (
         "📊 *Your Status*\n\n"
         f"🔥 New Token Alerts: {new_tokens_on}\n"
         f"🐋 Smart Money Alerts: {smart_money_on}\n"
+        f"⚠️ Manipulation Alerts: {manipulation_on}\n"
         f"📌 Tokens Tracked: {tracked_count}\n\n"
         f"*Bot Filters*\n"
         f"🔗 Chain: {CHAIN_FILTER.upper()}\n"
         f"💧 Min Liquidity: ${MIN_LIQUIDITY:,}\n"
         f"📊 Min 24h Volume: ${MIN_VOLUME:,}\n"
         f"⏱ New Token Last Check: {db.last_check_time}\n"
-        f"⏱ Smart Money Last Check: {db.smart_money_last_check_time}"
+        f"⏱ Smart Money Last Check: {db.smart_money_last_check_time}\n"
+        f"⏱ Manipulation Last Check: {db.manipulation_last_check_time}"
     )
 
     await update.message.reply_text(text, parse_mode="Markdown", reply_markup=main_menu_for(cid))
@@ -887,6 +971,7 @@ async def analytics_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     global_subs = len(db.token_alert_subscribers())
     smart_money_subs = len(db.smart_money_subscribers())
+    manipulation_subs = len(db.manipulation_subscribers())
     total_users = len(db.users)
     blocked_count = sum(1 for u in db.users.values() if u.get("blocked"))
     tracked_total = len(db.tracked_tokens)
@@ -908,6 +993,7 @@ async def analytics_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"👥 Total Users: {total_users}\n"
         f"🔥 New Token Alert Subscribers: {global_subs}\n"
         f"🐋 Smart Money Subscribers: {smart_money_subs}\n"
+        f"⚠️ Manipulation Alert Subscribers: {manipulation_subs}\n"
         f"📌 Total Tracked Tokens: {tracked_total}\n"
         f"🚫 Blocked: {blocked_count}\n"
         f"🧠 Total Analyses: {db.analyze_count}\n"
@@ -1011,7 +1097,7 @@ async def subscribe_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db.touch_user(cid)
     db.save()
     await update.message.reply_text(
-        "🔥 New token alerts enabled. You'll receive alerts when strong new tokens pass the filter. Smart Money mode stays exactly as you set it.",
+        "🔥 New token alerts enabled. You'll receive alerts when strong new tokens pass the filter. Smart Money and Manipulation modes stay exactly as you set them.",
         reply_markup=main_menu_for(cid),
     )
 
@@ -1022,7 +1108,7 @@ async def unsubscribe_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     db.touch_user(cid)
     db.save()
     await update.message.reply_text(
-        "🔥 New token alerts disabled. Smart Money mode stays exactly as you set it.",
+        "🔥 New token alerts disabled. Smart Money and Manipulation modes stay exactly as you set them.",
         reply_markup=main_menu_for(cid),
     )
 
@@ -1240,21 +1326,52 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(cid, text, parse_mode="Markdown", reply_markup=main_menu_for(cid))
         return
 
+    if data == "manipulation_on":
+        db.set_manipulation_alerts(cid, True)
+        db.save()
+        text = (
+            "⚠️ *Manipulation Alerts Enabled*\n\n"
+            "You'll receive warnings when a tracked token shows sudden price/volume spikes and pump-style behavior.\n"
+            "🔥 New Token Alerts and 🐋 Smart Money Alerts remain unchanged."
+        )
+        try:
+            await query.edit_message_text(text, parse_mode="Markdown", reply_markup=main_menu_for(cid))
+        except Exception:
+            await context.bot.send_message(cid, text, parse_mode="Markdown", reply_markup=main_menu_for(cid))
+        return
+
+    if data == "manipulation_off":
+        db.set_manipulation_alerts(cid, False)
+        db.save()
+        text = (
+            "⚠️ *Manipulation Alerts Disabled*\n\n"
+            "You won't receive pump-and-dump style warning alerts.\n"
+            "🔥 New Token Alerts and 🐋 Smart Money Alerts remain unchanged."
+        )
+        try:
+            await query.edit_message_text(text, parse_mode="Markdown", reply_markup=main_menu_for(cid))
+        except Exception:
+            await context.bot.send_message(cid, text, parse_mode="Markdown", reply_markup=main_menu_for(cid))
+        return
+
     if data == "status":
         new_tokens_on = "Enabled ✅" if db.token_alerts_enabled(cid) else "Disabled ❌"
         smart_money_on = "Enabled ✅" if db.smart_money_alerts_enabled(cid) else "Disabled ❌"
+        manipulation_on = "Enabled ✅" if db.manipulation_alerts_enabled(cid) else "Disabled ❌"
         tracked_count = len(db.get_tracked(cid))
         text = (
             "📊 *Your Status*\n\n"
             f"🔥 New Token Alerts: {new_tokens_on}\n"
             f"🐋 Smart Money Alerts: {smart_money_on}\n"
+            f"⚠️ Manipulation Alerts: {manipulation_on}\n"
             f"📌 Tokens Tracked: {tracked_count}\n\n"
             f"*Bot Filters*\n"
             f"🔗 Chain: {CHAIN_FILTER.upper()}\n"
             f"💧 Min Liquidity: ${MIN_LIQUIDITY:,}\n"
             f"📊 Min 24h Volume: ${MIN_VOLUME:,}\n"
             f"⏱ New Token Last Check: {db.last_check_time}\n"
-            f"⏱ Smart Money Last Check: {db.smart_money_last_check_time}"
+            f"⏱ Smart Money Last Check: {db.smart_money_last_check_time}\n"
+        f"⏱ Manipulation Last Check: {db.manipulation_last_check_time}"
         )
         try:
             await query.edit_message_text(text, parse_mode="Markdown", reply_markup=main_menu_for(cid))
@@ -1269,7 +1386,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "After searching, you can choose to track it and set alert preferences.\n\n"
             "*New Token Alerts* — optional broadcast of new tokens that pass the filter.\n"
             "*Smart Money Alerts* — optional alerts from tracked smart-money wallets on BSC.\n"
-            "✅ You can enable either one *or both together* from the main menu.\n"
+            "*Manipulation Alerts* — warnings for tracked tokens showing pump-style conditions.\n"
+            "✅ You can enable any one of them or run all modes together from the main menu.\n"
             "*Tracked Tokens* — your personal watchlist with custom alert settings."
         )
         try:
@@ -1641,6 +1759,7 @@ async def check_tracked_tokens(context: ContextTypes.DEFAULT_TYPE):
     according to each user's token-specific preferences.
     """
     log.info("check_tracked_tokens STARTED")
+    db.manipulation_last_check_time = _now()
     if not db.tracked_tokens:
         log.info("check_tracked_tokens: no tracked tokens.")
         return
@@ -1789,6 +1908,43 @@ async def check_tracked_tokens(context: ContextTypes.DEFAULT_TYPE):
                     log.warning(f"check_tracked_tokens: failed to send alert to {chat_id}: {e}")
                     if "blocked" in err or "chat not found" in err:
                         user["blocked"] = True
+
+            if db.manipulation_alerts_enabled(chat_id):
+                signal = detect_manipulation_signal(
+                    last_price=last_price,
+                    current_price=current_price,
+                    last_volume=last_volume,
+                    current_volume=current_volume,
+                    current_liquidity=current_liquidity,
+                    current_buys=current_buys,
+                    current_sells=current_sells,
+                )
+                if signal:
+                    message = build_manipulation_alert(
+                        symbol=symbol,
+                        chain_display=chain_display,
+                        dex_url=dex_url,
+                        signal=signal,
+                        last_price=last_price,
+                        current_price=current_price,
+                        last_volume=last_volume,
+                        current_volume=current_volume,
+                        current_buys=current_buys,
+                        current_sells=current_sells,
+                    )
+                    try:
+                        await context.bot.send_message(
+                            chat_id=chat_id,
+                            text=message,
+                            parse_mode="Markdown",
+                            disable_web_page_preview=True,
+                        )
+                        alerts_sent += 1
+                    except Exception as e:
+                        err = str(e).lower()
+                        log.warning(f"check_tracked_tokens: failed to send manipulation alert to {chat_id}: {e}")
+                        if "blocked" in err or "chat not found" in err:
+                            user["blocked"] = True
 
             record.update({
                 "last_price": current_price,
