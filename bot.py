@@ -1,6 +1,6 @@
 """
 Only Signals Bot — Version 2 (Production-ready single file)
-Architecture: per-user state, token tracking, optional new-token alerts, developer contact
+Architecture: per-user state, token tracking, independent new-token alerts and smart-money alerts, developer contact
 Storage: JSON (schema ready for PostgreSQL migration)
 Deployment: Railway / any Python host
 
@@ -816,7 +816,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "*What this bot does:*\n"
         "🔍 Search any token by name, symbol, or contract\n"
         "📌 Track tokens and set your own alert preferences\n"
-        "🔥 Optionally enable alerts for strong new tokens\n"
+        "🔥 Enable *New Token Alerts* if you want fresh listings\n"
+        "🐋 Enable *Smart Money Alerts* if you want wallet activity\n"
+        "⚙️ Run either one *or both together* from the main menu\n"
         "💬 Contact the developer for feedback or support\n\n"
         "Start by searching a token below 👇"
     )
@@ -843,9 +845,10 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "3) Get a signal scan\n"
         "4) Choose whether to track the token\n"
         "5) Configure per-token alert preferences\n\n"
-        "*Global Alerts:*\n"
-        "Optional — receive alerts when new tokens pass the filter.\n"
-        "Toggle from the main menu.\n\n"
+        "*Alert Modes:*\n"
+        "🔥 *New Token Alerts* — optional broadcast of fresh tokens that pass the filter.\n"
+        "🐋 *Smart Money Alerts* — optional alerts from tracked smart-money wallets on BSC.\n"
+        "✅ You can enable either one *or both together* from the main menu.\n\n"
         "⚠️ Signal scores are filters, not financial advice."
     )
     await update.message.reply_text(text, parse_mode="Markdown", reply_markup=main_menu_for(cid))
@@ -855,18 +858,21 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cid = update.effective_chat.id
     db.touch_user(cid)
 
-    global_on = "Enabled ✅" if db.token_alerts_enabled(cid) else "Disabled ❌"
+    new_tokens_on = "Enabled ✅" if db.token_alerts_enabled(cid) else "Disabled ❌"
+    smart_money_on = "Enabled ✅" if db.smart_money_alerts_enabled(cid) else "Disabled ❌"
     tracked_count = len(db.get_tracked(cid))
 
     text = (
         "📊 *Your Status*\n\n"
-        f"🔥 New Token Alerts: {global_on}\n"
+        f"🔥 New Token Alerts: {new_tokens_on}\n"
+        f"🐋 Smart Money Alerts: {smart_money_on}\n"
         f"📌 Tokens Tracked: {tracked_count}\n\n"
         f"*Bot Filters*\n"
         f"🔗 Chain: {CHAIN_FILTER.upper()}\n"
         f"💧 Min Liquidity: ${MIN_LIQUIDITY:,}\n"
         f"📊 Min 24h Volume: ${MIN_VOLUME:,}\n"
-        f"⏱ Last Check: {db.last_check_time}"
+        f"⏱ New Token Last Check: {db.last_check_time}\n"
+        f"⏱ Smart Money Last Check: {db.smart_money_last_check_time}"
     )
 
     await update.message.reply_text(text, parse_mode="Markdown", reply_markup=main_menu_for(cid))
@@ -901,6 +907,7 @@ async def analytics_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📈 *Owner Analytics*\n\n"
         f"👥 Total Users: {total_users}\n"
         f"🔥 New Token Alert Subscribers: {global_subs}\n"
+        f"🐋 Smart Money Subscribers: {smart_money_subs}\n"
         f"📌 Total Tracked Tokens: {tracked_total}\n"
         f"🚫 Blocked: {blocked_count}\n"
         f"🧠 Total Analyses: {db.analyze_count}\n"
@@ -1004,7 +1011,7 @@ async def subscribe_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db.touch_user(cid)
     db.save()
     await update.message.reply_text(
-        "🔥 New token alerts enabled. You'll receive alerts when strong new tokens pass the filter.",
+        "🔥 New token alerts enabled. You'll receive alerts when strong new tokens pass the filter. Smart Money mode stays exactly as you set it.",
         reply_markup=main_menu_for(cid),
     )
 
@@ -1015,7 +1022,7 @@ async def unsubscribe_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     db.touch_user(cid)
     db.save()
     await update.message.reply_text(
-        "🔥 New token alerts disabled.",
+        "🔥 New token alerts disabled. Smart Money mode stays exactly as you set it.",
         reply_markup=main_menu_for(cid),
     )
 
@@ -1182,7 +1189,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         db.save()
         text = (
             "🔥 *New Token Alerts Enabled*\n\n"
-            "You'll receive alerts when strong new tokens pass the filter."
+            "You'll receive alerts when strong new tokens pass the filter.\n"
+            "🐋 Smart Money Alerts remain unchanged, so you can run one mode or both together."
         )
         try:
             await query.edit_message_text(text, parse_mode="Markdown", reply_markup=main_menu_for(cid))
@@ -1196,7 +1204,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = (
             "🔥 *New Token Alerts Disabled*\n\n"
             "You won't receive alerts about strong new tokens.\n"
-            "Your tracked tokens are unaffected."
+            "🐋 Smart Money Alerts and your tracked tokens are unaffected."
         )
         try:
             await query.edit_message_text(text, parse_mode="Markdown", reply_markup=main_menu_for(cid))
@@ -1209,7 +1217,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         db.save()
         text = (
             "🐋 *Smart Money Alerts Enabled*\n\n"
-            "You'll receive alerts when the configured smart-money wallets buy or sell on BSC."
+            "You'll receive alerts when the configured smart-money wallets buy or sell on BSC.\n"
+            "🔥 New Token Alerts remain unchanged, so you can run one mode or both together."
         )
         try:
             await query.edit_message_text(text, parse_mode="Markdown", reply_markup=main_menu_for(cid))
@@ -1222,7 +1231,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         db.save()
         text = (
             "🐋 *Smart Money Alerts Disabled*\n\n"
-            "You won't receive smart-money wallet alerts."
+            "You won't receive smart-money wallet alerts.\n"
+            "🔥 New Token Alerts and your tracked tokens are unaffected."
         )
         try:
             await query.edit_message_text(text, parse_mode="Markdown", reply_markup=main_menu_for(cid))
@@ -1231,17 +1241,20 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "status":
-        global_on = "Enabled ✅" if db.token_alerts_enabled(cid) else "Disabled ❌"
+        new_tokens_on = "Enabled ✅" if db.token_alerts_enabled(cid) else "Disabled ❌"
+        smart_money_on = "Enabled ✅" if db.smart_money_alerts_enabled(cid) else "Disabled ❌"
         tracked_count = len(db.get_tracked(cid))
         text = (
             "📊 *Your Status*\n\n"
-            f"🔥 New Token Alerts: {global_on}\n"
+            f"🔥 New Token Alerts: {new_tokens_on}\n"
+            f"🐋 Smart Money Alerts: {smart_money_on}\n"
             f"📌 Tokens Tracked: {tracked_count}\n\n"
             f"*Bot Filters*\n"
             f"🔗 Chain: {CHAIN_FILTER.upper()}\n"
             f"💧 Min Liquidity: ${MIN_LIQUIDITY:,}\n"
             f"📊 Min 24h Volume: ${MIN_VOLUME:,}\n"
-            f"⏱ Last Check: {db.last_check_time}"
+            f"⏱ New Token Last Check: {db.last_check_time}\n"
+            f"⏱ Smart Money Last Check: {db.smart_money_last_check_time}"
         )
         try:
             await query.edit_message_text(text, parse_mode="Markdown", reply_markup=main_menu_for(cid))
@@ -1256,6 +1269,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "After searching, you can choose to track it and set alert preferences.\n\n"
             "*New Token Alerts* — optional broadcast of new tokens that pass the filter.\n"
             "*Smart Money Alerts* — optional alerts from tracked smart-money wallets on BSC.\n"
+            "✅ You can enable either one *or both together* from the main menu.\n"
             "*Tracked Tokens* — your personal watchlist with custom alert settings."
         )
         try:
