@@ -1,6 +1,6 @@
 """
 Only Signals Bot — Version 2 (Production-ready single file)
-Architecture: per-user state, token tracking, independent new-token alerts and smart-money alerts, developer contact
+Architecture: per-user state, token tracking, independent new-token alerts, smart-money alerts, and manipulation alerts, developer contact
 Storage: JSON (schema ready for PostgreSQL migration)
 Deployment: Railway / any Python host
 
@@ -899,7 +899,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📌 Track tokens and set your own alert preferences\n"
         "🔥 Enable *New Token Alerts* if you want fresh listings\n"
         "🐋 Enable *Smart Money Alerts* if you want wallet activity\n"
-        "⚙️ Run either one *or both together* from the main menu\n"
+        "⚙️ Run any one of them *or all three together* from the main menu\n"
         "💬 Contact the developer for feedback or support\n\n"
         "Start by searching a token below 👇"
     )
@@ -929,7 +929,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "*Alert Modes:*\n"
         "🔥 *New Token Alerts* — optional broadcast of fresh tokens that pass the filter.\n"
         "🐋 *Smart Money Alerts* — optional alerts from tracked smart-money wallets on BSC.\n"
-        "✅ You can enable either one *or both together* from the main menu.\n\n"
+        "⚠️ *Manipulation Alerts* — optional warnings for tracked tokens showing pump-style conditions.\n"
+        "✅ You can enable any one of them *or all three together* from the main menu.\n\n"
         "⚠️ Signal scores are filters, not financial advice."
     )
     await update.message.reply_text(text, parse_mode="Markdown", reply_markup=main_menu_for(cid))
@@ -944,12 +945,14 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     manipulation_on = "Enabled ✅" if db.manipulation_alerts_enabled(cid) else "Disabled ❌"
     tracked_count = len(db.get_tracked(cid))
 
+    manipulation_note = "\nℹ️ Manipulation alerts need at least one tracked token." if db.manipulation_alerts_enabled(cid) and tracked_count == 0 else ""
+
     text = (
         "📊 *Your Status*\n\n"
         f"🔥 New Token Alerts: {new_tokens_on}\n"
         f"🐋 Smart Money Alerts: {smart_money_on}\n"
         f"⚠️ Manipulation Alerts: {manipulation_on}\n"
-        f"📌 Tokens Tracked: {tracked_count}\n\n"
+        f"📌 Tokens Tracked: {tracked_count}{manipulation_note}\n\n"
         f"*Bot Filters*\n"
         f"🔗 Chain: {CHAIN_FILTER.upper()}\n"
         f"💧 Min Liquidity: ${MIN_LIQUIDITY:,}\n"
@@ -1276,7 +1279,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = (
             "🔥 *New Token Alerts Enabled*\n\n"
             "You'll receive alerts when strong new tokens pass the filter.\n"
-            "🐋 Smart Money Alerts remain unchanged, so you can run one mode or both together."
+            "🐋 Smart Money Alerts and ⚠️ Manipulation Alerts remain unchanged, so you can run any one mode or all three together."
         )
         try:
             await query.edit_message_text(text, parse_mode="Markdown", reply_markup=main_menu_for(cid))
@@ -1304,7 +1307,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = (
             "🐋 *Smart Money Alerts Enabled*\n\n"
             "You'll receive alerts when the configured smart-money wallets buy or sell on BSC.\n"
-            "🔥 New Token Alerts remain unchanged, so you can run one mode or both together."
+            "🔥 New Token Alerts and ⚠️ Manipulation Alerts remain unchanged, so you can run any one mode or all three together."
         )
         try:
             await query.edit_message_text(text, parse_mode="Markdown", reply_markup=main_menu_for(cid))
@@ -1359,19 +1362,20 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         smart_money_on = "Enabled ✅" if db.smart_money_alerts_enabled(cid) else "Disabled ❌"
         manipulation_on = "Enabled ✅" if db.manipulation_alerts_enabled(cid) else "Disabled ❌"
         tracked_count = len(db.get_tracked(cid))
+        manipulation_note = "\nℹ️ Manipulation alerts need at least one tracked token." if db.manipulation_alerts_enabled(cid) and tracked_count == 0 else ""
         text = (
             "📊 *Your Status*\n\n"
             f"🔥 New Token Alerts: {new_tokens_on}\n"
             f"🐋 Smart Money Alerts: {smart_money_on}\n"
             f"⚠️ Manipulation Alerts: {manipulation_on}\n"
-            f"📌 Tokens Tracked: {tracked_count}\n\n"
+            f"📌 Tokens Tracked: {tracked_count}{manipulation_note}\n\n"
             f"*Bot Filters*\n"
             f"🔗 Chain: {CHAIN_FILTER.upper()}\n"
             f"💧 Min Liquidity: ${MIN_LIQUIDITY:,}\n"
             f"📊 Min 24h Volume: ${MIN_VOLUME:,}\n"
             f"⏱ New Token Last Check: {db.last_check_time}\n"
             f"⏱ Smart Money Last Check: {db.smart_money_last_check_time}\n"
-        f"⏱ Manipulation Last Check: {db.manipulation_last_check_time}"
+            f"⏱ Manipulation Last Check: {db.manipulation_last_check_time}"
         )
         try:
             await query.edit_message_text(text, parse_mode="Markdown", reply_markup=main_menu_for(cid))
@@ -2055,6 +2059,6 @@ try:
 except Exception as e:
     log.warning(f"Could not start job queue: {e}")
 
-log.info("=== DEPLOY MARKER V3-FIXED ===")
+log.info("=== DEPLOY MARKER V4-THREE-MODES ===")
 log.info("Bot V2 fixed running...")
 app.run_polling()
