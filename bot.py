@@ -53,6 +53,10 @@ SMART_MONEY_WALLETS = [
     {"label": "Wallet 3", "address": "0x0000000000000000000000000000000000000003"},
 ]
 
+SMART_MONEY_CLUSTER_WINDOW_SECONDS = 900
+SMART_MONEY_MIN_CLUSTER_WALLETS = 2
+SMART_MONEY_MAX_TOKEN_ALERTS_PER_CYCLE = 10
+
 # Per-token alert thresholds
 PRICE_CHANGE_ALERT_PCT = 10.0
 VOLUME_SPIKE_RATIO = 3.0
@@ -725,7 +729,26 @@ def approximate_tx_usd_value(tx: dict) -> float:
     return 0.0
 
 
-def build_smart_money_alert(wallet_label: str, wallet_address: str, tx: dict) -> Optional[str]:
+def get_smart_money_token_key(tx: dict) -> str:
+    contract = normalize_address(tx.get("contractAddress", ""))
+    symbol = str(tx.get("tokenSymbol") or "?").upper().strip()
+    if contract.startswith("0x") and len(contract) == 42:
+        return f"bsc:{contract}"
+    return f"bsc:{symbol}"
+
+
+def classify_cluster_strength(wallet_count: int, unique_wallet_count: int) -> tuple[str, int]:
+    base_count = max(wallet_count, unique_wallet_count)
+    if base_count >= 6:
+        return "Very High", 90
+    if base_count >= 4:
+        return "High", 78
+    if base_count >= 3:
+        return "Medium", 66
+    return "Low", 52
+
+
+def build_smart_money_alert(wallet_label: str, wallet_address: str, tx: dict, cluster_info: Optional[dict] = None) -> Optional[str]:
     side = infer_tx_side(wallet_address, tx)
     if side == "transfer":
         return None
@@ -898,7 +921,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🔍 Search any token by name, symbol, or contract\n"
         "📌 Track tokens and set your own alert preferences\n"
         "🔥 Enable *New Token Alerts* if you want fresh listings\n"
-        "🐋 Enable *Smart Money Alerts* if you want wallet activity\n"
+        "🐋 Enable *Smart Money Alerts* if you want wallet activity + smart wallet cluster strength\n"
         "⚙️ Run any one of them *or all three together* from the main menu\n"
         "💬 Contact the developer for feedback or support\n\n"
         "Start by searching a token below 👇"
@@ -928,7 +951,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "5) Configure per-token alert preferences\n\n"
         "*Alert Modes:*\n"
         "🔥 *New Token Alerts* — optional broadcast of fresh tokens that pass the filter.\n"
-        "🐋 *Smart Money Alerts* — optional alerts from tracked smart-money wallets on BSC.\n"
+        "🐋 *Smart Money Alerts* — optional alerts from tracked smart-money wallets on BSC, including smart-wallet count and cluster strength.\n"
         "⚠️ *Manipulation Alerts* — optional warnings for tracked tokens showing pump-style conditions.\n"
         "✅ You can enable any one of them *or all three together* from the main menu.\n\n"
         "⚠️ Signal scores are filters, not financial advice."
@@ -1389,7 +1412,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Use the *Search Token* button or `/search` to look up any token.\n"
             "After searching, you can choose to track it and set alert preferences.\n\n"
             "*New Token Alerts* — optional broadcast of new tokens that pass the filter.\n"
-            "*Smart Money Alerts* — optional alerts from tracked smart-money wallets on BSC.\n"
+            "*Smart Money Alerts* — optional alerts from tracked smart-money wallets on BSC, including smart-wallet count and cluster strength.\n"
             "*Manipulation Alerts* — warnings for tracked tokens showing pump-style conditions.\n"
             "✅ You can enable any one of them or run all modes together from the main menu.\n"
             "*Tracked Tokens* — your personal watchlist with custom alert settings."
