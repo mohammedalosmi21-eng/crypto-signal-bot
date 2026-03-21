@@ -13,13 +13,14 @@ FIXES vs previous version:
 - Both handlers are wrapped so every code path produces a visible response.
 """
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, LabeledPrice
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
     CallbackQueryHandler,
     ContextTypes,
     MessageHandler,
+    PreCheckoutQueryHandler,
     filters,
 )
 from telegram.helpers import escape_markdown
@@ -37,6 +38,14 @@ from typing import Optional
 
 TOKEN = os.getenv("BOT_TOKEN")
 OWNER_CHAT_ID = 760930914
+
+# Subscription / payments
+TRIAL_DAYS = int(os.getenv("TRIAL_DAYS", "7"))
+PREMIUM_DAYS = int(os.getenv("PREMIUM_DAYS", "30"))
+STARS_PRICE = int(os.getenv("STARS_PRICE", "500"))
+PAYMENT_WALLET = os.getenv("PAYMENT_WALLET", "0x73c95943191fddc3e44fff22749c4ccc1ccc8a08")
+PAYMENT_NETWORK = os.getenv("PAYMENT_NETWORK", "BEP20 (BSC)")
+SUBSCRIPTION_PRICE_USDT = float(os.getenv("SUBSCRIPTION_PRICE_USDT", "10"))
 
 CHAIN_FILTER = "bsc"
 MIN_LIQUIDITY = 10000
@@ -88,6 +97,8 @@ def _now() -> str:
 
 
 def default_user(chat_id: int) -> dict:
+    now_dt = datetime.now()
+    now_str = now_dt.strftime("%Y-%m-%d %H:%M:%S")
     return {
         "chat_id": chat_id,
         "state": "idle",
@@ -96,8 +107,14 @@ def default_user(chat_id: int) -> dict:
         "smart_money_alerts": False,
         "manipulation_alerts": False,
         "blocked": False,
-        "first_seen": _now(),
-        "last_active": _now(),
+        "first_seen": now_str,
+        "last_active": now_str,
+        "trial_start": now_str,
+        "trial_end": (now_dt + timedelta(days=TRIAL_DAYS)).strftime("%Y-%m-%d %H:%M:%S"),
+        "is_paid": False,
+        "paid_until": None,
+        "subscription_plan": None,
+        "payment_method": None,
     }
 
 
@@ -120,6 +137,67 @@ def default_tracked_token(chat_id: int, token_key: str, symbol: str, name: str, 
         "last_liquidity": None,
         "last_checked": None,
     }
+
+
+def parse_dt(value: str):
+    try:
+        return datetime.strptime(value, "%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return None
+
+
+def is_trial_active(chat_id: int) -> bool:
+    user = db.get_user(chat_id) if "db" in globals() else None
+    if not user:
+        return False
+    trial_end = parse_dt(user.get("trial_end"))
+    return bool(trial_end and datetime.now() < trial_end)
+
+
+def is_paid_active(chat_id: int) -> bool:
+    user = db.get_user(chat_id) if "db" in globals() else None
+    if not user or not user.get("is_paid"):
+        return False
+    paid_until = parse_dt(user.get("paid_until"))
+    return bool(paid_until and datetime.now() < paid_until)
+
+
+def has_premium_access(chat_id: int) -> bool:
+    return is_trial_active(chat_id) or is_paid_active(chat_id)
+
+
+def trial_days_left(chat_id: int) -> int:
+    user = db.get_user(chat_id) if "db" in globals() else None
+    if not user:
+        return 0
+    trial_end = parse_dt(user.get("trial_end"))
+    if not trial_end:
+        return 0
+    delta = trial_end - datetime.now()
+    return max(0, delta.days + (1 if delta.seconds > 0 else 0))
+
+
+def build_payment_message() -> str:
+    return (
+        "💳 *Upgrade to Premium*\n\n"
+        f"After your *{TRIAL_DAYS}-day free trial*, premium access costs *{SUBSCRIPTION_PRICE_USDT:.0f} USDT / {PREMIUM_DAYS} days* or *{STARS_PRICE} Telegram Stars*.\n\n"
+        "*Premium unlocks:*\n"
+        "• 🐋 Smart Money Alerts\n"
+        "• ⚠️ Manipulation Alerts\n"
+        "• Priority intelligence layer\n\n"
+        f"*USDT option:*\nNetwork: {PAYMENT_NETWORK}\nAddress: `" + PAYMENT_WALLET + "`\n\n"
+        "⚠️ Only send USDT on the specified network.\n"
+        "If you prefer the easiest in-app payment, use Telegram Stars below."
+    )
+
+
+def trial_or_subscription_status(chat_id: int) -> str:
+    user = db.get_user(chat_id)
+    if is_paid_active(chat_id):
+        return f"💎 Premium active until {user.get('paid_until')}"
+    if is_trial_active(chat_id):
+        return f"🆓 Trial active — {trial_days_left(chat_id)} day(s) left"
+    return "⛔ Trial ended — premium required for Smart Money and Manipulation"
 
 
 # ─────────────────────────────────────────────
@@ -205,6 +283,26 @@ class BotData:
             int(uid) for uid, u in self.users.items()
             if u.get("manipulation_alerts") and not u.get("blocked")
         ]
+
+    def premium_subscribers(self) -> list:
+        return [
+            int(uid) for uid, u in self.users.items()
+            if u.get("is_paid") and not u.get("blocked")
+        ]
+
+    def premium_active_count(self) -> int:
+        now = datetime.now()
+        count = 0
+        for u in self.users.values():
+            if not u.get("is_paid"):
+                continue
+            try:
+                paid_until = datetime.strptime(u.get("paid_until") or "", "%Y-%m-%d %H:%M:%S")
+                if paid_until > now:
+                    count += 1
+            except Exception:
+                continue
+        return count
 
     # ── tracked token helpers ─────────────────
 
@@ -294,6 +392,18 @@ class BotData:
                         u["smart_money_alerts"] = False
                     if "manipulation_alerts" not in u:
                         u["manipulation_alerts"] = False
+                    if "trial_start" not in u:
+                        u["trial_start"] = _now()
+                    if "trial_end" not in u:
+                        u["trial_end"] = (datetime.now() + timedelta(days=TRIAL_DAYS)).strftime("%Y-%m-%d %H:%M:%S")
+                    if "is_paid" not in u:
+                        u["is_paid"] = False
+                    if "paid_until" not in u:
+                        u["paid_until"] = None
+                    if "subscription_plan" not in u:
+                        u["subscription_plan"] = None
+                    if "payment_method" not in u:
+                        u["payment_method"] = None
                 self.tracked_tokens = raw.get("tracked_tokens", {})
                 self.search_history = raw.get("search_history", [])
                 self.search_counts = raw.get("search_counts", {})
@@ -571,6 +681,7 @@ def main_menu_for(chat_id: int) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(toggle_label, callback_data=toggle_data)],
         [InlineKeyboardButton(sm_label, callback_data=sm_data)],
         [InlineKeyboardButton(manip_label, callback_data=manip_data)],
+        [InlineKeyboardButton("💳 Upgrade / Subscribe", callback_data="subscribe_info")],
         [InlineKeyboardButton("💬 Contact Developer", callback_data="contact_prompt")],
         [InlineKeyboardButton("❓ Help", callback_data="help")],
     ])
@@ -645,6 +756,14 @@ def my_tokens_menu(chat_id: int) -> InlineKeyboardMarkup:
         rows.append([InlineKeyboardButton(label, callback_data=f"token_detail|{t['token_key']}")])
     rows.append([InlineKeyboardButton("⬅️ Back", callback_data="back_main")])
     return InlineKeyboardMarkup(rows)
+
+
+def payment_options_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"⭐ Pay with Telegram Stars ({STARS_PRICE})", callback_data="subscribe_stars")],
+        [InlineKeyboardButton("💸 Show USDT Payment Details", callback_data="subscribe_usdt")],
+        [InlineKeyboardButton("⬅️ Main Menu", callback_data="back_main")],
+    ])
 
 
 # ─────────────────────────────────────────────
@@ -954,6 +1073,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🐋 *Smart Money Alerts* — optional alerts from tracked smart-money wallets on BSC, including smart-wallet count and cluster strength.\n"
         "⚠️ *Manipulation Alerts* — optional warnings for tracked tokens showing pump-style conditions.\n"
         "✅ You can enable any one of them *or all three together* from the main menu.\n\n"
+        f"🆓 Smart Money and Manipulation are included during your first *{TRIAL_DAYS}-day trial*. After that, premium payment is required.\n\n"
         "⚠️ Signal scores are filters, not financial advice."
     )
     await update.message.reply_text(text, parse_mode="Markdown", reply_markup=main_menu_for(cid))
@@ -1001,6 +1121,7 @@ async def analytics_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     total_users = len(db.users)
     blocked_count = sum(1 for u in db.users.values() if u.get("blocked"))
     tracked_total = len(db.tracked_tokens)
+    premium_active = db.premium_active_count()
 
     top_all = db.top_searches(limit=5)
     top_24h = db.top_searches_recent(days=1, limit=5)
@@ -1113,18 +1234,53 @@ async def myid_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def activatepaid_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cid = update.effective_chat.id
+    if cid != OWNER_CHAT_ID:
+        await update.message.reply_text("⛔ Owner only.")
+        return
+
+    if len(context.args) < 2:
+        await update.message.reply_text("Usage: /activatepaid <chat_id> <days>")
+        return
+
+    try:
+        target_chat_id = int(context.args[0])
+        days = int(context.args[1])
+    except Exception:
+        await update.message.reply_text("Invalid chat_id or days.")
+        return
+
+    user = db.get_user(target_chat_id)
+    user["is_paid"] = True
+    user["paid_until"] = (datetime.now() + timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
+    user["subscription_plan"] = f"manual_{days}d"
+    user["payment_method"] = "usdt_manual"
+    db.save()
+
+    await update.message.reply_text("✅ Premium activated manually.")
+    try:
+        await context.bot.send_message(
+            target_chat_id,
+            f"✅ *Payment confirmed*\n\nPremium access is now active for *{days} days*.",
+            parse_mode="Markdown",
+            reply_markup=main_menu_for(target_chat_id),
+        )
+    except Exception:
+        pass
+
+
 async def analyze_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await search_command(update, context)
 
 
 async def subscribe_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cid = update.effective_chat.id
-    db.set_token_alerts(cid, True)
     db.touch_user(cid)
-    db.save()
     await update.message.reply_text(
-        "🔥 New token alerts enabled. You'll receive alerts when strong new tokens pass the filter. Smart Money and Manipulation modes stay exactly as you set them.",
-        reply_markup=main_menu_for(cid),
+        build_payment_message(),
+        parse_mode="Markdown",
+        reply_markup=payment_options_menu(),
     )
 
 
@@ -1296,6 +1452,42 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(cid, "🔍 Send a token name, symbol, or contract address:")
         return
 
+    if data == "subscribe_info":
+        text = build_payment_message()
+        try:
+            await query.edit_message_text(text, parse_mode="Markdown", reply_markup=payment_options_menu())
+        except Exception:
+            await context.bot.send_message(cid, text, parse_mode="Markdown", reply_markup=payment_options_menu())
+        return
+
+    if data == "subscribe_usdt":
+        text = build_payment_message()
+        try:
+            await query.edit_message_text(text, parse_mode="Markdown", reply_markup=payment_options_menu())
+        except Exception:
+            await context.bot.send_message(cid, text, parse_mode="Markdown", reply_markup=payment_options_menu())
+        return
+
+    if data == "subscribe_stars":
+        if is_paid_active(cid):
+            text = "✅ *Premium is already active*\n\nNo payment is needed right now."
+            try:
+                await query.edit_message_text(text, parse_mode="Markdown", reply_markup=main_menu_for(cid))
+            except Exception:
+                await context.bot.send_message(cid, text, parse_mode="Markdown", reply_markup=main_menu_for(cid))
+            return
+
+        prices = [LabeledPrice(f"Quantara Premium - {PREMIUM_DAYS} days", STARS_PRICE)]
+        await context.bot.send_invoice(
+            chat_id=cid,
+            title="Quantara Premium",
+            description=f"Unlock premium features for {PREMIUM_DAYS} days",
+            payload=f"premium_{cid}_{int(datetime.now().timestamp())}",
+            currency="XTR",
+            prices=prices,
+        )
+        return
+
     if data == "token_alerts_on":
         db.set_token_alerts(cid, True)
         db.save()
@@ -1325,6 +1517,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "smart_money_on":
+        if not has_premium_access(cid):
+            text = build_payment_message()
+            await context.bot.send_message(cid, text, parse_mode="Markdown", reply_markup=payment_options_menu())
+            return
         db.set_smart_money_alerts(cid, True)
         db.save()
         text = (
@@ -1353,6 +1549,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "manipulation_on":
+        if not has_premium_access(cid):
+            text = build_payment_message()
+            await context.bot.send_message(cid, text, parse_mode="Markdown", reply_markup=payment_options_menu())
+            return
         db.set_manipulation_alerts(cid, True)
         db.save()
         text = (
@@ -2047,6 +2247,34 @@ async def check_smart_money(context: ContextTypes.DEFAULT_TYPE):
     db.save()
 
 
+async def precheckout_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.pre_checkout_query
+    try:
+        await query.answer(ok=True)
+    except Exception as e:
+        log.warning(f"precheckout_callback failed: {e}")
+
+
+async def successful_payment_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.message
+    if not message or not message.successful_payment:
+        return
+
+    cid = message.chat_id
+    user = db.get_user(cid)
+    user["is_paid"] = True
+    user["paid_until"] = (datetime.now() + timedelta(days=PREMIUM_DAYS)).strftime("%Y-%m-%d %H:%M:%S")
+    user["subscription_plan"] = f"premium_{PREMIUM_DAYS}d"
+    user["payment_method"] = "telegram_stars"
+    db.save()
+
+    await message.reply_text(
+        f"✅ *Payment received*\n\nPremium access is now active for *{PREMIUM_DAYS} days*.\n\nYou can now enable 🐋 Smart Money Alerts and ⚠️ Manipulation Alerts.",
+        parse_mode="Markdown",
+        reply_markup=main_menu_for(cid),
+    )
+
+
 # ─────────────────────────────────────────────
 # APP SETUP & RUN
 # ─────────────────────────────────────────────
@@ -2064,11 +2292,14 @@ app.add_handler(CommandHandler("mytokens", mytokens_command))
 app.add_handler(CommandHandler("contact", contact_command))
 app.add_handler(CommandHandler("reply", reply_command))
 app.add_handler(CommandHandler("myid", myid_command))
+app.add_handler(CommandHandler("activatepaid", activatepaid_command))
 app.add_handler(CommandHandler("analyze", analyze_command))
 app.add_handler(CommandHandler("subscribe", subscribe_command))
 app.add_handler(CommandHandler("unsubscribe", unsubscribe_command))
 
+app.add_handler(PreCheckoutQueryHandler(precheckout_callback))
 app.add_handler(CallbackQueryHandler(button_handler))
+app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_handler))
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
 
 try:
