@@ -43,9 +43,18 @@ OWNER_CHAT_ID = 760930914
 TRIAL_DAYS = int(os.getenv("TRIAL_DAYS", "7"))
 PREMIUM_DAYS = int(os.getenv("PREMIUM_DAYS", "30"))
 STARS_PRICE = int(os.getenv("STARS_PRICE", "500"))
+TRADER_STARS_PRICE = int(os.getenv("TRADER_STARS_PRICE", "150"))
+PRO_STARS_PRICE = int(os.getenv("PRO_STARS_PRICE", "500"))
+ELITE_STARS_PRICE = int(os.getenv("ELITE_STARS_PRICE", "1200"))
 PAYMENT_WALLET = os.getenv("PAYMENT_WALLET", "0x73c95943191fddc3e44fff22749c4ccc1ccc8a08")
 PAYMENT_NETWORK = os.getenv("PAYMENT_NETWORK", "BEP20 (BSC)")
 SUBSCRIPTION_PRICE_USDT = float(os.getenv("SUBSCRIPTION_PRICE_USDT", "10"))
+
+PLAN_CATALOG = {
+    "trader": {"label": "Trader", "rank": 1, "stars": TRADER_STARS_PRICE, "usdt": 5, "days": 30, "headline": "Fast alerts + cleaner execution", "features": ["⚡ Fast Alerts mode", "📦 Up to 15 tracked tokens", "🔔 Basic alerts with faster cadence", "🧪 Alpha Preview"]},
+    "pro": {"label": "Pro Alpha", "rank": 2, "stars": PRO_STARS_PRICE, "usdt": 10, "days": 30, "headline": "Decision edge for serious traders", "features": ["🐋 Smart Money Alerts", "⚠️ Manipulation Alerts", "📡 Real-time Signals", "🧬 Full Alpha Breakdown", "⚡/📊/📈 Alert modes"]},
+    "elite": {"label": "Elite", "rank": 3, "stars": ELITE_STARS_PRICE, "usdt": 25, "days": 30, "headline": "Priority intelligence + custom control", "features": ["⚙️ Custom Filters", "🚨 Priority signal framing", "📦 Up to 100 tracked tokens", "💬 Priority support", "Everything in Pro Alpha"]},
+}
 
 CHAIN_FILTER = "bsc"
 MIN_LIQUIDITY = 10000
@@ -113,8 +122,11 @@ def default_user(chat_id: int) -> dict:
         "trial_end": (now_dt + timedelta(days=TRIAL_DAYS)).strftime("%Y-%m-%d %H:%M:%S"),
         "is_paid": False,
         "paid_until": None,
-        "subscription_plan": None,
+        "subscription_plan": "free",
+        "subscription_tier": "free",
         "payment_method": None,
+        "alert_mode": "normal",
+        "custom_filters": False,
     }
 
 
@@ -193,13 +205,157 @@ def build_payment_message() -> str:
 
 def trial_or_subscription_status(chat_id: int) -> str:
     user = db.get_user(chat_id)
+    tier = user.get("subscription_tier", "free")
+    label = "Free" if tier == "free" else PLAN_CATALOG.get(tier, {}).get("label", tier.title())
     if is_paid_active(chat_id):
-        return f"💎 Premium active until {user.get('paid_until')}"
+        return f"💎 {label} active until {user.get('paid_until')}"
     if is_trial_active(chat_id):
         return f"🆓 Trial active — {trial_days_left(chat_id)} day(s) left"
-    return "⛔ Trial ended — premium required for Smart Money, Manipulation, and full Alpha Breakdown"
+    return "⛔ Trial ended — premium required for Smart Money and Manipulation"
 
 
+def current_user_tier(chat_id: int) -> str:
+    user = db.get_user(chat_id)
+    if is_paid_active(chat_id):
+        return user.get("subscription_tier", "pro")
+    if is_trial_active(chat_id):
+        return "trial"
+    return "free"
+
+
+def tier_rank_value(tier: str) -> int:
+    if tier == "trial":
+        return PLAN_CATALOG["pro"]["rank"]
+    if tier == "free":
+        return 0
+    return PLAN_CATALOG.get(tier, {}).get("rank", 0)
+
+
+def feature_allowed(chat_id: int, feature: str) -> bool:
+    tier = current_user_tier(chat_id)
+    rank = tier_rank_value(tier)
+    if feature in {"search", "basic_alerts", "my_tokens", "status", "alpha_preview", "alert_mode_basic"}:
+        return True
+    if feature == "fast_mode":
+        return rank >= 1
+    if feature in {"smart_money", "manipulation", "signals_realtime", "alpha_full"}:
+        return rank >= 2
+    if feature == "custom_filters":
+        return rank >= 3
+    return False
+
+
+def tracked_token_limit_for(chat_id: int) -> int:
+    tier = current_user_tier(chat_id)
+    if tier == "trial":
+        return 50
+    if tier == "elite":
+        return 100
+    if tier == "pro":
+        return 50
+    if tier == "trader":
+        return 15
+    return 5
+
+
+def alert_mode_label(mode: str) -> str:
+    return {"fast": "⚡ Fast", "normal": "📊 Normal", "long": "📈 Long-term"}.get(mode, "📊 Normal")
+
+
+def alert_check_interval_seconds(chat_id: int) -> int:
+    mode = db.get_user(chat_id).get("alert_mode", "normal")
+    if mode == "fast":
+        return 300
+    if mode == "long":
+        return 86400
+    return 10800
+
+
+def premium_plan_card(plan_key: str) -> str:
+    plan = PLAN_CATALOG[plan_key]
+    body = "\n".join(f"• {item}" for item in plan["features"])
+    return f"*{plan['label']}*\n{plan['headline']}\nStars: *{plan['stars']}*  |  USDT: *{plan['usdt']}*  |  Days: *{plan['days']}*\n\n{body}"
+
+
+def build_subscription_hub(chat_id: int) -> str:
+    tier = current_user_tier(chat_id)
+    tier_label = "Free" if tier == "free" else ("Trial" if tier == "trial" else PLAN_CATALOG[tier]["label"])
+    return (
+        f"💎 *Quantara Subscription Hub*\n\nCurrent access: *{tier_label}*\nStatus: {trial_or_subscription_status(chat_id)}\n\n"
+        f"*Free keeps the bot useful:*\n• 📊 Prices / Search\n• 🔔 Basic Alerts\n• 📦 My Tokens\n\n"
+        f"*Premium sells decisions, not raw data:*\n• 🐋 Smart Money\n• ⚠️ Manipulation\n• 📡 Real-time Signals\n• ⚙️ Custom Filters\n• 🧬 Full Alpha Lab\n\n"
+        f"Choose the plan that matches your speed and edge."
+    )
+
+
+def alpha_components(pair: dict) -> dict:
+    liquidity = safe_float((pair.get("liquidity") or {}).get("usd"))
+    volume = safe_float((pair.get("volume") or {}).get("h24"))
+    buys = int(((pair.get("txns") or {}).get("h24") or {}).get("buys") or 0)
+    sells = int(((pair.get("txns") or {}).get("h24") or {}).get("sells") or 0)
+    price_change = safe_float((pair.get("priceChange") or {}).get("h24"))
+    score = 0
+    risk = 35
+    notes = []
+    if liquidity >= 100_000:
+        score += 28; notes.append("deep liquidity")
+    elif liquidity >= 30_000:
+        score += 18; notes.append("usable liquidity")
+    else:
+        risk += 15; notes.append("thin liquidity")
+    if volume >= 100_000:
+        score += 24; notes.append("strong volume")
+    elif volume >= 20_000:
+        score += 14; notes.append("moderate volume")
+    else:
+        risk += 10; notes.append("weak volume")
+    flow_ratio = buys / max(sells, 1)
+    if flow_ratio >= 1.8:
+        score += 18; notes.append("buy pressure")
+    elif flow_ratio < 0.8:
+        risk += 12; notes.append("sell pressure")
+    if -8 <= price_change <= 18:
+        score += 14; notes.append("healthy momentum")
+    elif price_change > 35:
+        risk += 18; notes.append("overextended move")
+    elif price_change < -20:
+        risk += 10; notes.append("heavy downside")
+    if liquidity > 0 and volume / max(liquidity, 1) > 3:
+        risk += 12; notes.append("volume/liquidity imbalance")
+    alpha = max(5, min(95, score))
+    risk = max(5, min(95, risk))
+    if alpha >= 75 and risk <= 45:
+        grade, verdict, action = "A", "Offensive", "Act fast if confirmation aligns"
+    elif alpha >= 60 and risk <= 60:
+        grade, verdict, action = "B", "Constructive", "Watch closely / size selectively"
+    elif alpha >= 45:
+        grade, verdict, action = "C", "Mixed", "Observe, do not chase"
+    else:
+        grade, verdict, action = "D", "Weak", "Avoid until structure improves"
+    probability = min(90, max(20, int(alpha - (risk * 0.35) + 20)))
+    return {"alpha": alpha, "risk": risk, "grade": grade, "verdict": verdict, "action": action, "probability": probability, "notes": notes, "price_change": price_change, "buys": buys, "sells": sells}
+
+
+def build_alpha_summary(pair: dict, premium: bool = False) -> str:
+    c = alpha_components(pair)
+    notes = ", ".join(c["notes"][:3]) if c["notes"] else "no clear edge"
+    text = (
+        f"🧬 *Alpha Summary*\n"
+        f"Alpha Score: *{c['alpha']}*/95\n"
+        f"Risk Score: *{c['risk']}*/95\n"
+        f"Grade: *{c['grade']}*  |  Probability: *{c['probability']}%*\n"
+        f"Verdict: *{c['verdict']}*\n"
+        f"Driver: {escape_markdown(notes, version=1)}\n"
+        f"Action: *{escape_markdown(c['action'], version=1)}*"
+    )
+    if premium:
+        text += f"\n\nBuy/Sell Flow: *{c['buys']} / {c['sells']}*\n24h Change: *{c['price_change']:.2f}%*"
+    return text
+
+
+# ─────────────────────────────────────────────
+# RUNTIME STATE
+# ─────────────────────────────────────────────
 # ─────────────────────────────────────────────
 # RUNTIME STATE
 # ─────────────────────────────────────────────
@@ -401,9 +557,15 @@ class BotData:
                     if "paid_until" not in u:
                         u["paid_until"] = None
                     if "subscription_plan" not in u:
-                        u["subscription_plan"] = None
+                        u["subscription_plan"] = "free"
+                    if "subscription_tier" not in u:
+                        u["subscription_tier"] = "free"
                     if "payment_method" not in u:
                         u["payment_method"] = None
+                    if "alert_mode" not in u:
+                        u["alert_mode"] = "normal"
+                    if "custom_filters" not in u:
+                        u["custom_filters"] = False
                 self.tracked_tokens = raw.get("tracked_tokens", {})
                 self.search_history = raw.get("search_history", [])
                 self.search_counts = raw.get("search_counts", {})
@@ -620,8 +782,6 @@ def build_scan_msg(pair: dict, header: str = "🧠 *Token Scan*") -> str:
 
     link_line = f"\n🔗 [View on Dexscreener]({url})" if url else ""
 
-    alpha_summary = build_alpha_summary(pair)
-
     return (
         f"{header}\n\n"
         f"🪙 *Token:* {symbol}\n"
@@ -631,8 +791,7 @@ def build_scan_msg(pair: dict, header: str = "🧠 *Token Scan*") -> str:
         f"📈 *24h Change:* {price_change}%\n"
         f"💧 *Liquidity:* ${fmt_money((pair.get('liquidity') or {}).get('usd'))}\n"
         f"📊 *Volume 24h:* ${fmt_money((pair.get('volume') or {}).get('h24'))}\n"
-        f"🎯 *Signal Score:* {score_pct}/100\n"
-        f"{alpha_summary}\n\n"
+        f"🎯 *Signal Score:* {score_pct}/100\n\n"
         f"*Verdict:* {verdict}\n"
         f"*Why:* {' | '.join(notes)}"
         f"{link_line}"
@@ -661,236 +820,30 @@ def can_query_token_pairs(token_key: str) -> bool:
 
 
 # ─────────────────────────────────────────────
-# ALPHA ENGINE
-# ─────────────────────────────────────────────
-
-def clamp_score(value: float, low: int = 0, high: int = 100) -> int:
-    return max(low, min(high, int(round(value))))
-
-
-def alpha_grade(score: int) -> str:
-    if score >= 80:
-        return "A"
-    if score >= 68:
-        return "B"
-    if score >= 55:
-        return "C"
-    return "D"
-
-
-def alpha_verdict(score: int) -> str:
-    if score >= 80:
-        return "🟢 High-Conviction Momentum"
-    if score >= 68:
-        return "🟡 Tradeable Setup"
-    if score >= 55:
-        return "🟠 Watchlist Only"
-    return "🔴 Avoid / Low Edge"
-
-
-def alpha_action(score: int, risk_score: int) -> str:
-    if score >= 80 and risk_score <= 45:
-        return "Action: Build starter size only on strength; scale after confirmation."
-    if score >= 68:
-        return "Action: Watch for follow-through; avoid oversized entry."
-    if score >= 55:
-        return "Action: Keep on watchlist; wait for stronger confirmation."
-    return "Action: Preserve capital; no edge yet."
-
-
-def compute_alpha_engine(pair: dict) -> dict:
-    liquidity = safe_float((pair.get("liquidity") or {}).get("usd"))
-    volume = safe_float((pair.get("volume") or {}).get("h24"))
-    buys = int(((pair.get("txns") or {}).get("h24") or {}).get("buys") or 0)
-    sells = int(((pair.get("txns") or {}).get("h24") or {}).get("sells") or 0)
-    price_change = safe_float((pair.get("priceChange") or {}).get("h24"), 0.0)
-    fdv = safe_float(pair.get("fdv"))
-    market_cap = safe_float(pair.get("marketCap"))
-
-    momentum = clamp_score(
-        min(max(price_change, -25.0), 80.0) * 0.75
-        + min(volume / 4000.0, 25.0)
-        + min(max(buys - sells, 0) / 6.0, 15.0)
-    )
-    liquidity_score = clamp_score(min(liquidity / 1500.0, 100.0))
-    flow_ratio = buys / max(sells, 1)
-    flow_score = clamp_score(min(flow_ratio * 22.0, 100.0))
-
-    valuation_score = 55
-    valuation_note = "valuation neutral"
-    if market_cap > 0 and fdv > 0:
-        ratio = fdv / max(market_cap, 1.0)
-        if ratio <= 1.25:
-            valuation_score = 78
-            valuation_note = "healthy FDV / market-cap ratio"
-        elif ratio <= 1.8:
-            valuation_score = 64
-            valuation_note = "acceptable valuation expansion"
-        else:
-            valuation_score = 38
-            valuation_note = "stretched valuation / unlock risk"
-    elif fdv > 0:
-        if fdv <= 20_000_000:
-            valuation_score = 65
-            valuation_note = "reasonable FDV"
-        elif fdv <= 80_000_000:
-            valuation_score = 52
-            valuation_note = "mid-range FDV"
-        else:
-            valuation_score = 35
-            valuation_note = "high FDV — upside may compress"
-
-    risk_score = 45
-    risk_flags = []
-    if liquidity < 25_000:
-        risk_score += 18
-        risk_flags.append("thin liquidity")
-    if sells > buys * 1.35 and sells > 25:
-        risk_score += 14
-        risk_flags.append("sell pressure")
-    if price_change > 45:
-        risk_score += 10
-        risk_flags.append("extended move")
-    if volume < 15_000:
-        risk_score += 10
-        risk_flags.append("weak participation")
-    if fdv > 0 and market_cap > 0 and fdv / max(market_cap, 1.0) > 1.8:
-        risk_score += 10
-        risk_flags.append("valuation unlock risk")
-    risk_score = clamp_score(risk_score)
-
-    alpha_score = clamp_score(
-        momentum * 0.35
-        + liquidity_score * 0.25
-        + flow_score * 0.20
-        + valuation_score * 0.20
-        - max(risk_score - 55, 0) * 0.20
-    )
-
-    notes = []
-    if liquidity >= 100_000:
-        notes.append("institutional-grade liquidity")
-    elif liquidity >= 40_000:
-        notes.append("tradable liquidity base")
-    else:
-        notes.append("liquidity needs caution")
-
-    if flow_ratio >= 2.0:
-        notes.append("buyers clearly dominate tape")
-    elif flow_ratio >= 1.1:
-        notes.append("modest buy-side advantage")
-    else:
-        notes.append("flow not yet decisive")
-
-    if volume >= 100_000:
-        notes.append("volume confirms interest")
-    elif volume >= 20_000:
-        notes.append("volume acceptable")
-    else:
-        notes.append("volume too soft for conviction")
-
-    notes.append(valuation_note)
-
-    return {
-        "alpha_score": alpha_score,
-        "grade": alpha_grade(alpha_score),
-        "verdict": alpha_verdict(alpha_score),
-        "action": alpha_action(alpha_score, risk_score),
-        "risk_score": risk_score,
-        "momentum_score": momentum,
-        "liquidity_score": liquidity_score,
-        "flow_score": flow_score,
-        "valuation_score": valuation_score,
-        "flow_ratio": round(flow_ratio, 2),
-        "notes": notes,
-        "risk_flags": risk_flags or ["no major red flag detected"],
-    }
-
-
-def build_alpha_summary(pair: dict) -> str:
-    alpha = compute_alpha_engine(pair)
-    score = alpha["alpha_score"]
-    if score >= 80:
-        edge = "High"
-    elif score >= 68:
-        edge = "Medium"
-    elif score >= 55:
-        edge = "Low"
-    else:
-        edge = "Weak"
-
-    return (
-        f"🧬 *Alpha Score:* {score}/100 ({alpha['grade']})\n"
-        f"⚖️ *Risk Score:* {alpha['risk_score']}/100\n"
-        f"🎯 *Edge:* {edge}\n"
-        f"*Alpha Verdict:* {alpha['verdict']}"
-    )
-
-
-def build_alpha_breakdown_msg(pair: dict, premium: bool = False) -> str:
-    base = pair.get("baseToken") or {}
-    symbol = escape_markdown(str(base.get("symbol", "N/A")), version=1)
-    name = escape_markdown(str(base.get("name", "N/A")), version=1)
-    alpha = compute_alpha_engine(pair)
-
-    text = (
-        f"🧬 *Alpha Breakdown — {symbol}*\n"
-        f"📛 {name}\n\n"
-        f"🎯 *Alpha Score:* {alpha['alpha_score']}/100 ({alpha['grade']})\n"
-        f"⚠️ *Risk Score:* {alpha['risk_score']}/100\n"
-        f"*Verdict:* {alpha['verdict']}\n"
-        f"*Action:* {escape_markdown(alpha['action'], version=1)}\n\n"
-    )
-
-    if premium:
-        notes = "\n".join([f"• {escape_markdown(n, version=1)}" for n in alpha['notes']])
-        flags = "\n".join([f"• {escape_markdown(f, version=1)}" for f in alpha['risk_flags']])
-        text += (
-            f"*Component Scores*\n"
-            f"• Momentum: {alpha['momentum_score']}/100\n"
-            f"• Liquidity: {alpha['liquidity_score']}/100\n"
-            f"• Order Flow: {alpha['flow_score']}/100 (buy/sell ratio {alpha['flow_ratio']})\n"
-            f"• Valuation: {alpha['valuation_score']}/100\n\n"
-            f"*What supports the setup*\n{notes}\n\n"
-            f"*Risk flags*\n{flags}"
-        )
-    else:
-        text += (
-            "🔒 *Premium detail locked*\n"
-            "Upgrade to unlock component scores, risk flags, and execution framing."
-        )
-
-    return text
-
-
-# ─────────────────────────────────────────────
 # KEYBOARDS / MENUS
 # ─────────────────────────────────────────────
 
 def main_menu_for(chat_id: int) -> InlineKeyboardMarkup:
     enabled = db.token_alerts_enabled(chat_id)
-    toggle_label = "🔥 New Token Alerts: ON ✅" if enabled else "🔥 New Token Alerts: OFF ❌"
+    toggle_label = "🔔 Basic Alerts: ON ✅" if enabled else "🔔 Basic Alerts: OFF ❌"
     toggle_data = "token_alerts_off" if enabled else "token_alerts_on"
     sm_enabled = db.smart_money_alerts_enabled(chat_id)
-    sm_label = "🐋 Smart Money Alerts: ON ✅" if sm_enabled else "🐋 Smart Money Alerts: OFF ❌"
+    sm_label = "🐋 Smart Money: ON ✅" if sm_enabled else "🐋 Smart Money: OFF ❌"
     sm_data = "smart_money_off" if sm_enabled else "smart_money_on"
     manip_enabled = db.manipulation_alerts_enabled(chat_id)
-    manip_label = "⚠️ Manipulation Alerts: ON ✅" if manip_enabled else "⚠️ Manipulation Alerts: OFF ❌"
+    manip_label = "⚠️ Manipulation: ON ✅" if manip_enabled else "⚠️ Manipulation: OFF ❌"
     manip_data = "manipulation_off" if manip_enabled else "manipulation_on"
+    mode_label = alert_mode_label(db.get_user(chat_id).get("alert_mode", "normal"))
 
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔍 Search Token", callback_data="search_prompt")],
-        [
-            InlineKeyboardButton("📋 My Tracked Tokens", callback_data="my_tokens"),
-            InlineKeyboardButton("📊 Status", callback_data="status"),
-        ],
-        [InlineKeyboardButton(toggle_label, callback_data=toggle_data)],
+        [InlineKeyboardButton("📊 Prices / Search", callback_data="search_prompt")],
+        [InlineKeyboardButton(toggle_label, callback_data=toggle_data), InlineKeyboardButton("📦 My Tokens", callback_data="my_tokens")],
+        [InlineKeyboardButton(f"⏱ Alert Mode: {mode_label}", callback_data="alert_mode_menu")],
         [InlineKeyboardButton(sm_label, callback_data=sm_data)],
         [InlineKeyboardButton(manip_label, callback_data=manip_data)],
-        [InlineKeyboardButton("🧬 Alpha Lab", callback_data="alpha_lab")],
-        [InlineKeyboardButton("💳 Upgrade / Subscribe", callback_data="subscribe_info")],
-        [InlineKeyboardButton("💬 Contact Developer", callback_data="contact_prompt")],
-        [InlineKeyboardButton("❓ Help", callback_data="help")],
+        [InlineKeyboardButton("🧬 Alpha Lab", callback_data="alpha_lab"), InlineKeyboardButton("⚙️ Custom Filters", callback_data="custom_filters")],
+        [InlineKeyboardButton("💎 Upgrade", callback_data="subscribe_info"), InlineKeyboardButton("📊 Status", callback_data="status")],
+        [InlineKeyboardButton("💬 Contact Developer", callback_data="contact_prompt"), InlineKeyboardButton("❓ Help", callback_data="help")],
     ])
 
 
@@ -967,25 +920,36 @@ def my_tokens_menu(chat_id: int) -> InlineKeyboardMarkup:
 
 def payment_options_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"⭐ Pay with Telegram Stars ({STARS_PRICE})", callback_data="subscribe_stars")],
+        [InlineKeyboardButton(f"🟡 Trader — {PLAN_CATALOG['trader']['stars']}⭐", callback_data="plan_trader")],
+        [InlineKeyboardButton(f"🔵 Pro Alpha — {PLAN_CATALOG['pro']['stars']}⭐", callback_data="plan_pro")],
+        [InlineKeyboardButton(f"🔴 Elite — {PLAN_CATALOG['elite']['stars']}⭐", callback_data="plan_elite")],
         [InlineKeyboardButton("💸 Show USDT Payment Details", callback_data="subscribe_usdt")],
         [InlineKeyboardButton("⬅️ Main Menu", callback_data="back_main")],
     ])
 
 
-def alpha_lab_menu(premium: bool) -> InlineKeyboardMarkup:
-    if premium:
-        return InlineKeyboardMarkup([
-            [InlineKeyboardButton("🔍 Search Token", callback_data="search_prompt")],
-            [InlineKeyboardButton("⬅️ Main Menu", callback_data="back_main")],
-        ])
+def alert_mode_menu(chat_id: int) -> InlineKeyboardMarkup:
+    current = db.get_user(chat_id).get("alert_mode", "normal")
+    def row(mode: str, label: str):
+        prefix = "✅ " if current == mode else ""
+        return [InlineKeyboardButton(prefix + label, callback_data=f"mode_{mode}")]
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("💳 Unlock Premium Alpha", callback_data="subscribe_info")],
+        row("fast", "⚡ Fast Alerts"),
+        row("normal", "📊 Normal"),
+        row("long", "📈 Long-term"),
+        [InlineKeyboardButton("⬅️ Main Menu", callback_data="back_main")],
+    ])
+
+
+def premium_gate_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("💎 Upgrade to Pro Alpha", callback_data="subscribe_info")],
         [InlineKeyboardButton("⬅️ Main Menu", callback_data="back_main")],
     ])
 
 
 # ─────────────────────────────────────────────
+# SMART MONEY LAYER# ─────────────────────────────────────────────
 # SMART MONEY LAYER (BSC via BscScan)
 # ─────────────────────────────────────────────
 
@@ -1253,17 +1217,19 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db.save()
 
     text = (
-        "🚀 *Only Signals — V2*\n\n"
-        "Your personal crypto intelligence bot.\n\n"
-        "*What this bot does:*\n"
-        "🔍 Search any token by name, symbol, or contract\n"
-        "📌 Track tokens and set your own alert preferences\n"
-        "🔥 Enable *New Token Alerts* if you want fresh listings\n"
-        "🐋 Enable *Smart Money Alerts* if you want wallet activity + smart wallet cluster strength\n"
-        "🧬 Use *Alpha Lab* for conviction score, risk framing, and execution guidance\n"
-        "⚙️ Run any one of them *or all three together* from the main menu\n"
-        "💬 Contact the developer for feedback or support\n\n"
-        "Start by searching a token below 👇"
+        "🚀 *Quantara — Crypto Decision Engine*\n\n"
+        "Built to sell *decisions*, not raw data.\n\n"
+        "*Free Layer*\n"
+        "• 📊 Prices / Search\n"
+        "• 🔔 Basic Alerts\n"
+        "• 📦 My Tokens\n\n"
+        "*Premium Layer*\n"
+        "• 🐋 Smart Money\n"
+        "• ⚠️ Manipulation Detection\n"
+        "• 📡 Real-time Signals\n"
+        "• 🧬 Alpha Lab\n"
+        "• ⚙️ Custom Filters\n\n"
+        "Choose an option below:"
     )
 
     await update.message.reply_text(text, parse_mode="Markdown", reply_markup=main_menu_for(cid))
@@ -1292,7 +1258,6 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🔥 *New Token Alerts* — optional broadcast of fresh tokens that pass the filter.\n"
         "🐋 *Smart Money Alerts* — optional alerts from tracked smart-money wallets on BSC, including smart-wallet count and cluster strength.\n"
         "⚠️ *Manipulation Alerts* — optional warnings for tracked tokens showing pump-style conditions.\n"
-        "🧬 *Alpha Lab* — converts raw token data into an Alpha Score, risk score, and action framing.\n"
         "✅ You can enable any one of them *or all three together* from the main menu.\n\n"
         f"🆓 Smart Money and Manipulation are included during your first *{TRIAL_DAYS}-day trial*. After that, premium payment is required.\n\n"
         "⚠️ Signal scores are filters, not financial advice."
@@ -1476,6 +1441,7 @@ async def activatepaid_command(update: Update, context: ContextTypes.DEFAULT_TYP
     user["is_paid"] = True
     user["paid_until"] = (datetime.now() + timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
     user["subscription_plan"] = f"manual_{days}d"
+    user["subscription_tier"] = "pro"
     user["payment_method"] = "usdt_manual"
     db.save()
 
@@ -1499,7 +1465,7 @@ async def subscribe_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cid = update.effective_chat.id
     db.touch_user(cid)
     await update.message.reply_text(
-        build_payment_message(),
+        build_subscription_hub(cid),
         parse_mode="Markdown",
         reply_markup=payment_options_menu(),
     )
@@ -1609,12 +1575,9 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     scan_text = build_scan_msg(best)
-    await update.message.reply_text(scan_text, parse_mode="Markdown", disable_web_page_preview=True)
-
     context.user_data["last_pair"] = best
-    alpha_preview = build_alpha_breakdown_msg(best, premium=has_premium_access(cid))
-    alpha_kb = alpha_lab_menu(has_premium_access(cid))
-    await update.message.reply_text(alpha_preview, parse_mode="Markdown", disable_web_page_preview=True, reply_markup=alpha_kb)
+    await update.message.reply_text(scan_text, parse_mode="Markdown", disable_web_page_preview=True)
+    await update.message.reply_text(build_alpha_summary(best, premium=feature_allowed(cid, "alpha_full")), parse_mode="Markdown")
 
     token_key = extract_token_key(best)
     symbol = (best.get("baseToken") or {}).get("symbol", "???")
@@ -1678,8 +1641,58 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(cid, "🔍 Send a token name, symbol, or contract address:")
         return
 
+    if data == "alert_mode_menu":
+        text = "⏱ *Alert Speed*\n\n⚡ *Fast Alerts* — best for active traders\n📊 *Normal* — balanced default\n📈 *Long-term* — low-noise monitoring\n\nChoose the mode that fits your style."
+        try:
+            await query.edit_message_text(text, parse_mode="Markdown", reply_markup=alert_mode_menu(cid))
+        except Exception:
+            await context.bot.send_message(cid, text, parse_mode="Markdown", reply_markup=alert_mode_menu(cid))
+        return
+
+    if data in {"mode_fast", "mode_normal", "mode_long"}:
+        mode = data.split("_", 1)[1]
+        if mode == "fast" and not feature_allowed(cid, "fast_mode"):
+            await context.bot.send_message(cid, "⚡ *Fast Alerts* is a paid feature in Trader and above.", parse_mode="Markdown", reply_markup=premium_gate_menu())
+            return
+        db.get_user(cid)["alert_mode"] = mode
+        db.save()
+        text = f"✅ Alert mode set to *{alert_mode_label(mode)}*\n\nCurrent cadence target: ~{alert_check_interval_seconds(cid)//60} minutes."
+        try:
+            await query.edit_message_text(text, parse_mode="Markdown", reply_markup=main_menu_for(cid))
+        except Exception:
+            await context.bot.send_message(cid, text, parse_mode="Markdown", reply_markup=main_menu_for(cid))
+        return
+
+    if data == "alpha_lab":
+        last_pair = context.user_data.get("last_pair")
+        if not last_pair:
+            await context.bot.send_message(cid, "🧬 Alpha Lab needs a recent token scan first. Use *Prices / Search* and scan a token.", parse_mode="Markdown", reply_markup=main_menu_for(cid))
+            return
+        premium = feature_allowed(cid, "alpha_full")
+        text = build_alpha_summary(last_pair, premium=premium)
+        if not premium:
+            text += "\n\n🔒 Full Alpha Breakdown is available in *Pro Alpha* and above."
+        try:
+            await query.edit_message_text(text, parse_mode="Markdown", reply_markup=(premium_gate_menu() if not premium else main_menu_for(cid)))
+        except Exception:
+            await context.bot.send_message(cid, text, parse_mode="Markdown", reply_markup=(premium_gate_menu() if not premium else main_menu_for(cid)))
+        return
+
+    if data == "custom_filters":
+        if not feature_allowed(cid, "custom_filters"):
+            await context.bot.send_message(cid, "⚙️ *Custom Filters* are reserved for *Elite*.", parse_mode="Markdown", reply_markup=premium_gate_menu())
+            return
+        db.get_user(cid)["custom_filters"] = True
+        db.save()
+        text = "⚙️ *Custom Filters*\n\nElite mode unlocked. In the next phase we can wire bespoke liquidity / volume / signal thresholds for your workflow."
+        try:
+            await query.edit_message_text(text, parse_mode="Markdown", reply_markup=main_menu_for(cid))
+        except Exception:
+            await context.bot.send_message(cid, text, parse_mode="Markdown", reply_markup=main_menu_for(cid))
+        return
+
     if data == "subscribe_info":
-        text = build_payment_message()
+        text = build_subscription_hub(cid) + "\n\n" + premium_plan_card("trader") + "\n\n" + premium_plan_card("pro") + "\n\n" + premium_plan_card("elite")
         try:
             await query.edit_message_text(text, parse_mode="Markdown", reply_markup=payment_options_menu())
         except Exception:
@@ -1687,31 +1700,19 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "subscribe_usdt":
-        text = build_payment_message()
+        text = build_subscription_hub(cid) + "\n\n*USDT settlement*\n" + "\n".join(f"• {PLAN_CATALOG[k]['label']}: {PLAN_CATALOG[k]['usdt']} USDT / {PLAN_CATALOG[k]['days']} days" for k in ["trader", "pro", "elite"]) + f"\n\nNetwork: {PAYMENT_NETWORK}\nAddress: `{PAYMENT_WALLET}`\n\nAfter payment, send proof to the developer for activation."
         try:
             await query.edit_message_text(text, parse_mode="Markdown", reply_markup=payment_options_menu())
         except Exception:
             await context.bot.send_message(cid, text, parse_mode="Markdown", reply_markup=payment_options_menu())
         return
 
-    if data == "subscribe_stars":
-        if is_paid_active(cid):
-            text = "✅ *Premium is already active*\n\nNo payment is needed right now."
-            try:
-                await query.edit_message_text(text, parse_mode="Markdown", reply_markup=main_menu_for(cid))
-            except Exception:
-                await context.bot.send_message(cid, text, parse_mode="Markdown", reply_markup=main_menu_for(cid))
-            return
-
-        prices = [LabeledPrice(f"Quantara Premium - {PREMIUM_DAYS} days", STARS_PRICE)]
-        await context.bot.send_invoice(
-            chat_id=cid,
-            title="Quantara Premium",
-            description=f"Unlock premium features for {PREMIUM_DAYS} days",
-            payload=f"premium_{cid}_{int(datetime.now().timestamp())}",
-            currency="XTR",
-            prices=prices,
-        )
+    if data in {"plan_trader", "plan_pro", "plan_elite"}:
+        plan_key = data.split("_", 1)[1]
+        plan = PLAN_CATALOG[plan_key]
+        context.user_data["pending_plan"] = plan_key
+        prices = [LabeledPrice(f"{plan['label']} - {plan['days']} days", plan["stars"])]
+        await context.bot.send_invoice(chat_id=cid, title=f"Quantara {plan['label']}", description=plan["headline"], payload=f"{plan_key}_{cid}_{int(datetime.now().timestamp())}", currency="XTR", prices=prices)
         return
 
     if data == "token_alerts_on":
@@ -1841,8 +1842,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "*Smart Money Alerts* — optional alerts from tracked smart-money wallets on BSC, including smart-wallet count and cluster strength.\n"
             "*Manipulation Alerts* — warnings for tracked tokens showing pump-style conditions.\n"
             "✅ You can enable any one of them or run all modes together from the main menu.\n"
-            "*Tracked Tokens* — your personal watchlist with custom alert settings.\n"
-            "*Alpha Lab* — your conviction layer on top of the scan."
+            "*Tracked Tokens* — your personal watchlist with custom alert settings."
         )
         try:
             await query.edit_message_text(text, parse_mode="Markdown", reply_markup=main_menu_for(cid))
@@ -1959,50 +1959,29 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ── track_add ──────────────────────────────────────────────────────────
     if data.startswith("track_add:"):
         token_key = data.split(":", 1)[1]
-        pending = context.user_data.get("pending_track", {})
-
-        existing_entry = db.get_tracked_token(cid, token_key) or {}
-        symbol = pending.get("symbol") or existing_entry.get("symbol") or "???"
-        name = pending.get("name") or existing_entry.get("name") or "???"
-        chain = pending.get("chain") or existing_entry.get("chain") or "unknown"
-
-        already_exists = db.get_tracked_token(cid, token_key) is not None
+        pending = context.user_data.get("pending_track") or {}
+        symbol = pending.get("symbol", token_key)
+        name = pending.get("name", symbol)
+        chain = pending.get("chain", parse_token_key(token_key)[0] or "bsc")
+        if db.get_tracked_token(cid, token_key):
+            text = f"✅ *{escape_markdown(symbol, version=1)}* is already in your tracked list."
+            try:
+                await query.edit_message_text(text, parse_mode="Markdown", reply_markup=tracked_token_action_menu(token_key))
+            except Exception:
+                await context.bot.send_message(cid, text, parse_mode="Markdown", reply_markup=tracked_token_action_menu(token_key))
+            return
+        if len(db.get_tracked(cid)) >= tracked_token_limit_for(cid):
+            text = f"⛔ Tracking limit reached. Your current tier allows *{tracked_token_limit_for(cid)}* tracked tokens."
+            await context.bot.send_message(cid, text, parse_mode="Markdown", reply_markup=premium_gate_menu())
+            return
         db.track_token(cid, token_key, symbol, name, chain)
         db.save()
         context.user_data.pop("pending_track", None)
-
-        safe_symbol = escape_markdown(symbol, version=1)
-
-        if already_exists:
-            confirmation_text = (
-                f"ℹ️ *{safe_symbol}* is already in your tracked list.\n\n"
-                "Manage alerts from *My Tracked Tokens*, or remove it below:"
-            )
-        else:
-            confirmation_text = (
-                f"✅ *{safe_symbol}* was added to your tracked list.\n\n"
-                "Manage alerts any time from *My Tracked Tokens*, or remove it below:"
-            )
-
-        # Best-effort edit of original prompt message
+        text = f"📦 *{escape_markdown(symbol, version=1)}* added to your tracked list.\n\nManage alerts below."
         try:
-            await query.edit_message_text(
-                f"✅ *{safe_symbol}* saved.",
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("⬅️ Main Menu", callback_data="back_main")]
-                ]),
-            )
-        except Exception as e:
-            log.debug(f"track_add: edit_message_text non-fatal: {e}")
-
-        # Always send the confirmation as a fresh message
-        await context.bot.send_message(
-            chat_id=cid,
-            text=confirmation_text,
-            parse_mode="Markdown",
-            reply_markup=tracked_token_action_menu(token_key),
-        )
+            await query.edit_message_text(text, parse_mode="Markdown", reply_markup=tracked_token_action_menu(token_key))
+        except Exception:
+            await context.bot.send_message(cid, text, parse_mode="Markdown", reply_markup=tracked_token_action_menu(token_key))
         return
 
     # ── track_skip ─────────────────────────────────────────────────────────
@@ -2540,6 +2519,6 @@ try:
 except Exception as e:
     log.warning(f"Could not start job queue: {e}")
 
-log.info("=== DEPLOY MARKER V4-THREE-MODES ===")
-log.info("Bot V2 fixed running...")
+log.info("=== DEPLOY MARKER V6-UI-PREMIUM-ALPHA ===")
+log.info("Quantara UI premium alpha running...")
 app.run_polling()
