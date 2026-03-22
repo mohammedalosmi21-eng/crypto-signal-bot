@@ -24,6 +24,7 @@ from telegram.ext import (
     filters,
 )
 from telegram.helpers import escape_markdown
+print("=== DEPLOY MARKER V7-TRACK-FIX ===")
 import requests
 from datetime import datetime, timedelta
 import json
@@ -1933,12 +1934,41 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data.startswith("manage_alerts:"):
         token_key = data.split(":", 1)[1]
+        entry = db.get_tracked_token(cid, token_key)
+
+        if not entry:
+            await context.bot.send_message(
+                chat_id=cid,
+                text="⚠️ Token not found in your tracked list.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("📋 My Tracked Tokens", callback_data="my_tokens")],
+                    [InlineKeyboardButton("⬅️ Main Menu", callback_data="back_main")],
+                ]),
+            )
+            return
+
         delivered = await _send_alert_settings(context, cid, token_key)
+
         if delivered:
             try:
-                await query.edit_message_reply_markup(reply_markup=None)
+                await query.edit_message_text(
+                    "⚙️ Alert settings opened below.",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("📋 My Tracked Tokens", callback_data="my_tokens")],
+                        [InlineKeyboardButton("⬅️ Main Menu", callback_data="back_main")],
+                    ]),
+                )
             except Exception as e:
-                log.debug(f"manage_alerts: could not remove previous keyboard (non-fatal): {e}")
+                log.debug(f"manage_alerts: edit_message_text non-fatal: {e}")
+        else:
+            await context.bot.send_message(
+                chat_id=cid,
+                text="⚠️ Could not open alert settings right now. Please try again.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("📋 My Tracked Tokens", callback_data="my_tokens")],
+                    [InlineKeyboardButton("⬅️ Main Menu", callback_data="back_main")],
+                ]),
+            )
         return
 
     if data.startswith("track_remove_confirm:"):
@@ -1963,25 +1993,58 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         symbol = pending.get("symbol", token_key)
         name = pending.get("name", symbol)
         chain = pending.get("chain", parse_token_key(token_key)[0] or "bsc")
-        if db.get_tracked_token(cid, token_key):
+
+        existing = db.get_tracked_token(cid, token_key)
+        if existing:
+            symbol = existing.get("symbol", symbol)
             text = f"✅ *{escape_markdown(symbol, version=1)}* is already in your tracked list."
+            await context.bot.send_message(
+                cid,
+                text,
+                parse_mode="Markdown",
+                reply_markup=tracked_token_action_menu(token_key),
+            )
             try:
-                await query.edit_message_text(text, parse_mode="Markdown", reply_markup=tracked_token_action_menu(token_key))
-            except Exception:
-                await context.bot.send_message(cid, text, parse_mode="Markdown", reply_markup=tracked_token_action_menu(token_key))
+                await query.edit_message_reply_markup(reply_markup=None)
+            except Exception as e:
+                log.debug(f"track_add(existing): edit_message_reply_markup non-fatal: {e}")
             return
-        if len(db.get_tracked(cid)) >= tracked_token_limit_for(cid):
-            text = f"⛔ Tracking limit reached. Your current tier allows *{tracked_token_limit_for(cid)}* tracked tokens."
+
+        current_limit = tracked_token_limit_for(cid)
+        if len(db.get_tracked(cid)) >= current_limit:
+            text = f"⛔ Tracking limit reached. Your current tier allows *{current_limit}* tracked tokens."
             await context.bot.send_message(cid, text, parse_mode="Markdown", reply_markup=premium_gate_menu())
+            try:
+                await query.edit_message_reply_markup(reply_markup=None)
+            except Exception as e:
+                log.debug(f"track_add(limit): edit_message_reply_markup non-fatal: {e}")
             return
+
         db.track_token(cid, token_key, symbol, name, chain)
         db.save()
         context.user_data.pop("pending_track", None)
-        text = f"📦 *{escape_markdown(symbol, version=1)}* added to your tracked list.\n\nManage alerts below."
+
+        text = (
+            f"✅ *{escape_markdown(symbol, version=1)}* was added to *My Tokens*.\n\n"
+            "You can manage its alerts below or go back to the main menu."
+        )
+        await context.bot.send_message(
+            cid,
+            text,
+            parse_mode="Markdown",
+            reply_markup=tracked_token_action_menu(token_key),
+        )
         try:
-            await query.edit_message_text(text, parse_mode="Markdown", reply_markup=tracked_token_action_menu(token_key))
-        except Exception:
-            await context.bot.send_message(cid, text, parse_mode="Markdown", reply_markup=tracked_token_action_menu(token_key))
+            await query.edit_message_text(
+                f"📦 *{escape_markdown(symbol, version=1)}* added successfully.",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("📋 My Tokens", callback_data="my_tokens")],
+                    [InlineKeyboardButton("⬅️ Main Menu", callback_data="back_main")],
+                ]),
+            )
+        except Exception as e:
+            log.debug(f"track_add: edit_message_text non-fatal: {e}")
         return
 
     # ── track_skip ─────────────────────────────────────────────────────────
@@ -1993,21 +2056,34 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             safe_symbol = escape_markdown(entry.get("symbol", token_key), version=1)
             text = (
                 f"ℹ️ *{safe_symbol}* is already in your tracked list.\n\n"
-                "Manage alerts from *My Tracked Tokens*, or remove it below:"
+                "Manage alerts from *My Tokens* or return to the main menu."
+            )
+            await context.bot.send_message(
+                cid,
+                text,
+                parse_mode="Markdown",
+                reply_markup=tracked_token_action_menu(token_key),
             )
             try:
-                await query.edit_message_text(text, parse_mode="Markdown",
-                                               reply_markup=tracked_token_action_menu(token_key))
-            except Exception:
-                await context.bot.send_message(cid, text, parse_mode="Markdown",
-                                                reply_markup=tracked_token_action_menu(token_key))
+                await query.edit_message_reply_markup(reply_markup=None)
+            except Exception as e:
+                log.debug(f"track_skip(existing): edit_message_reply_markup non-fatal: {e}")
         else:
             context.user_data.pop("pending_track", None)
-            text = "👍 No problem. This token was not added to your tracked list."
+            text = "👍 No problem. This token was not added to *My Tokens*."
+            await context.bot.send_message(
+                cid,
+                text,
+                parse_mode="Markdown",
+                reply_markup=main_menu_for(cid),
+            )
             try:
-                await query.edit_message_text(text, reply_markup=main_menu_for(cid))
-            except Exception:
-                await context.bot.send_message(cid, text, reply_markup=main_menu_for(cid))
+                await query.edit_message_text(
+                    "Skipped. Back to the main menu below.",
+                    reply_markup=main_menu_for(cid),
+                )
+            except Exception as e:
+                log.debug(f"track_skip: edit_message_text non-fatal: {e}")
         return
 
     # ── track_remove ───────────────────────────────────────────────────────
@@ -2522,4 +2598,3 @@ except Exception as e:
 log.info("=== DEPLOY MARKER V6-UI-PREMIUM-ALPHA ===")
 log.info("Quantara UI premium alpha running...")
 app.run_polling()
-
