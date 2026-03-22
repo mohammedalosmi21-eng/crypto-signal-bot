@@ -42,7 +42,7 @@ OWNER_CHAT_ID = 760930914
 # Subscription / payments
 TRIAL_DAYS = int(os.getenv("TRIAL_DAYS", "7"))
 PREMIUM_DAYS = int(os.getenv("PREMIUM_DAYS", "30"))
-STARS_PRICE = int(os.getenv("STARS_PRICE", "500"))
+STARS_PRICE = int(os.getenv("STARS_PRICE", "1"))
 PAYMENT_WALLET = os.getenv("PAYMENT_WALLET", "0x73c95943191fddc3e44fff22749c4ccc1ccc8a08")
 PAYMENT_NETWORK = os.getenv("PAYMENT_NETWORK", "BEP20 (BSC)")
 SUBSCRIPTION_PRICE_USDT = float(os.getenv("SUBSCRIPTION_PRICE_USDT", "10"))
@@ -2316,4 +2316,5 @@ except Exception as e:
 log.info("=== DEPLOY MARKER V4-THREE-MODES ===")
 log.info("Bot V2 fixed running...")
 app.run_polling()
+
 
