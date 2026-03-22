@@ -2522,3 +2522,4 @@ except Exception as e:
 log.info("=== DEPLOY MARKER V6-UI-PREMIUM-ALPHA ===")
 log.info("Quantara UI premium alpha running...")
 app.run_polling()
+
