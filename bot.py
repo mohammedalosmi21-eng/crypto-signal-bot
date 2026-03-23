@@ -31,7 +31,7 @@ FIXES in this version (V10 — callback resolution):
   are visible in production logs.
 """
 
-print("=== DEPLOY MARKER V13-DEDICATED-TRACK-HANDLERS ===")
+print("=== DEPLOY MARKER V14-DEBUG-CALLBACKS ===")
 
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, LabeledPrice
@@ -1719,6 +1719,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     cid = query.message.chat_id
     data = query.data
+    print("DEBUG CALLBACK [button_handler]:", data)
     db.touch_user(cid)
     await log_button_trace(context, cid, data, "ENTER")
 
@@ -2643,6 +2644,7 @@ async def check_smart_money(context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_track_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    print("DEBUG CALLBACK [handle_track_pending]:", query.data)
     try:
         await query.answer()
     except Exception:
@@ -2720,6 +2722,7 @@ async def handle_track_pending(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def handle_manage_alerts_direct(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    print("DEBUG CALLBACK [handle_manage_alerts_direct]:", query.data)
     try:
         await query.answer()
     except Exception:
@@ -2840,6 +2843,7 @@ try:
 except Exception as e:
     log.warning(f"Could not start job queue: {e}")
 
-log.info("=== DEPLOY MARKER V13-DEDICATED-TRACK-HANDLERS ===")
+log.info("=== DEPLOY MARKER V14-DEBUG-CALLBACKS ===")
 log.info("Quantara UI premium alpha running...")
 app.run_polling()
+
