@@ -31,7 +31,7 @@ FIXES in this version (V10 — callback resolution):
   are visible in production logs.
 """
 
-print("=== DEPLOY MARKER V18-AUTO-TRACK-NO-PROMPT ===")
+print("=== DEPLOY MARKER V19-FREE-DATA-LAYER ===")
 
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, LabeledPrice
@@ -85,7 +85,9 @@ MIN_VOLUME = 5000
 CHECK_INTERVAL = 180
 MAX_ALERTS_PER_CYCLE = 1
 DATA_FILE = "bot_data.json"
-BSCSCAN_API_KEY = os.getenv("BSCSCAN_API_KEY", "")
+BSCSCAN_API_KEY = os.getenv("BSCSCAN_API_KEY", "")  # optional, not required for the free data layer
+BNB_RPC_URL = os.getenv("BNB_RPC_URL", "https://bsc-dataseed.bnbchain.org")
+GECKO_TERMINAL_BASE = os.getenv("GECKO_TERMINAL_BASE", "https://api.geckoterminal.com/api/v2")
 SMART_MONEY_CHECK_INTERVAL = 180
 SMART_MONEY_MIN_TOKEN_VALUE_USD = 1000.0
 SMART_MONEY_WALLETS = [
@@ -715,18 +717,82 @@ def get_latest_profiles() -> list:
     return []
 
 
+def gecko_get(path: str, params: dict = None, timeout: int = 15):
+    try:
+        r = requests.get(f"{GECKO_TERMINAL_BASE}{path}", params=params, timeout=timeout, headers={"Accept": "application/json"})
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        log.warning(f"GeckoTerminal request failed for {path}: {e}")
+    return None
+
+
+def _to_dex_pair_from_gecko_pool(pool: dict) -> dict:
+    attrs = pool.get("attributes") or {}
+    relationships = pool.get("relationships") or {}
+    base_data = ((relationships.get("base_token") or {}).get("data") or {})
+    chain = str(attrs.get("network") or CHAIN_FILTER).lower()
+    price_usd = attrs.get("base_token_price_usd") or attrs.get("price_in_usd") or "0"
+    return {
+        "chainId": chain,
+        "dexId": attrs.get("dex_name") or "geckoterminal",
+        "url": attrs.get("reserve_in_usd") and f"https://www.geckoterminal.com/{chain}/pools/{pool.get('id','').split('_')[-1]}",
+        "priceUsd": price_usd,
+        "priceChange": {"h24": attrs.get("price_change_percentage", {}).get("h24") if isinstance(attrs.get("price_change_percentage"), dict) else attrs.get("price_percent_change_24h") or 0},
+        "liquidity": {"usd": attrs.get("reserve_in_usd") or 0},
+        "volume": {"h24": attrs.get("volume_usd", {}).get("h24") if isinstance(attrs.get("volume_usd"), dict) else attrs.get("volume_usd_24h") or 0},
+        "txns": {"h24": {"buys": (attrs.get("transactions") or {}).get("h24", {}).get("buys", 0) if isinstance(attrs.get("transactions"), dict) else 0,
+                          "sells": (attrs.get("transactions") or {}).get("h24", {}).get("sells", 0) if isinstance(attrs.get("transactions"), dict) else 0}},
+        "baseToken": {
+            "address": base_data.get("id", "").split('_')[-1] if base_data.get("id") else "",
+            "symbol": attrs.get("name", "?").split("/")[0].strip() if attrs.get("name") else "?",
+            "name": attrs.get("name", "?"),
+        },
+    }
+
+
+def gecko_search_pairs(q: str) -> list:
+    data = gecko_get("/search/pools", params={"query": q})
+    if not data or not isinstance(data, dict):
+        return []
+    pools = data.get("data") or []
+    out = []
+    for pool in pools[:10]:
+        try:
+            out.append(_to_dex_pair_from_gecko_pool(pool))
+        except Exception as e:
+            log.warning(f"Failed to normalize GeckoTerminal pool: {e}")
+    return out
+
+
+def gecko_get_token_pools(chain: str, addr: str) -> list:
+    data = gecko_get(f"/networks/{chain}/tokens/{addr}/pools")
+    if not data or not isinstance(data, dict):
+        return []
+    pools = data.get("data") or []
+    out = []
+    for pool in pools[:10]:
+        try:
+            out.append(_to_dex_pair_from_gecko_pool(pool))
+        except Exception as e:
+            log.warning(f"Failed to normalize GeckoTerminal token pool: {e}")
+    return out
+
+
 def search_pairs(q: str) -> list:
     data = dex_get("https://api.dexscreener.com/latest/dex/search", params={"q": q})
     if data and isinstance(data, dict):
-        return data.get("pairs", []) or []
-    return []
+        pairs = data.get("pairs", []) or []
+        if pairs:
+            return pairs
+    return gecko_search_pairs(q)
 
 
 def get_token_pairs(chain: str, addr: str) -> list:
     data = dex_get(f"https://api.dexscreener.com/token-pairs/v1/{chain}/{addr}")
-    if data and isinstance(data, list):
+    if data and isinstance(data, list) and data:
         return data
-    return []
+    return gecko_get_token_pools(chain, addr)
 
 
 # ─────────────────────────────────────────────
@@ -1046,6 +1112,7 @@ def smart_wallets() -> list:
 
 
 def bscscan_get(params: dict, timeout: int = 20):
+    # Optional explorer path. The free data layer does not require this key.
     if not BSCSCAN_API_KEY:
         return None
     full_params = dict(params)
@@ -1170,11 +1237,14 @@ def build_smart_money_alert(wallet_label: str, wallet_address: str, tx: dict, cl
 
 
 async def smart_money_check(token_key: str) -> dict:
-    # kept for compatibility with older code paths
+    # Free-data-layer compatible status report. Smart money can work later with
+    # optional explorer or RPC enrichment, but the core product no longer
+    # depends on a paid explorer API to search, score, or track tokens.
     return {
-        "status": "bscscan_ready" if BSCSCAN_API_KEY else "disabled",
+        "status": "optional_explorer" if BSCSCAN_API_KEY else "free_data_layer",
         "tracked_wallets": len(smart_wallets()),
-        "confidence": 60 if BSCSCAN_API_KEY else 0,
+        "confidence": 60 if BSCSCAN_API_KEY else 35,
+        "market_data": "DexScreener + GeckoTerminal",
     }
 
 
