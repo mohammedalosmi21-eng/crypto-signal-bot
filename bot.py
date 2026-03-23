@@ -24,7 +24,7 @@ from telegram.ext import (
     filters,
 )
 from telegram.helpers import escape_markdown
-print("=== DEPLOY MARKER V7-TRACK-FIX ===")
+print("=== DEPLOY MARKER V8-CALLBACK-REF ===")
 import requests
 from datetime import datetime, timedelta
 import json
@@ -32,6 +32,7 @@ import os
 import logging
 import asyncio
 from typing import Optional
+import hashlib
 
 # ─────────────────────────────────────────────
 # CONFIG
@@ -128,6 +129,7 @@ def default_user(chat_id: int) -> dict:
         "payment_method": None,
         "alert_mode": "normal",
         "custom_filters": False,
+        "callback_token_map": {},
     }
 
 
@@ -820,6 +822,24 @@ def can_query_token_pairs(token_key: str) -> bool:
     return bool(chain and ident and ident.startswith("0x"))
 
 
+def make_token_ref(token_key: str) -> str:
+    return hashlib.sha1(token_key.encode("utf-8")).hexdigest()[:12]
+
+
+def remember_token_ref(chat_id: int, token_key: str) -> str:
+    user = db.get_user(chat_id)
+    mapping = user.setdefault("callback_token_map", {})
+    ref = make_token_ref(token_key)
+    mapping[ref] = token_key
+    return ref
+
+
+def resolve_token_ref(chat_id: int, token_ref: str) -> str:
+    user = db.get_user(chat_id)
+    mapping = user.get("callback_token_map", {}) or {}
+    return mapping.get(token_ref, token_ref)
+
+
 # ─────────────────────────────────────────────
 # KEYBOARDS / MENUS
 # ─────────────────────────────────────────────
@@ -848,11 +868,12 @@ def main_menu_for(chat_id: int) -> InlineKeyboardMarkup:
     ])
 
 
-def track_prompt_menu(token_key: str) -> InlineKeyboardMarkup:
+def track_prompt_menu(chat_id: int, token_key: str) -> InlineKeyboardMarkup:
+    token_ref = remember_token_ref(chat_id, token_key)
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("✅ Track this token", callback_data=f"track_add:{token_key}"),
-            InlineKeyboardButton("❌ No thanks", callback_data=f"track_skip:{token_key}"),
+            InlineKeyboardButton("✅ Track this token", callback_data=f"track_add:{token_ref}"),
+            InlineKeyboardButton("❌ No thanks", callback_data=f"track_skip:{token_ref}"),
         ]
     ])
 
@@ -872,34 +893,37 @@ def alert_prefs_menu(chat_id: int, token_key: str) -> InlineKeyboardMarkup:
     # token_key already contains a colon (chain:address), so we MUST use a
     # different separator between pref_name and token_key to avoid ambiguity.
     # Pipe (|) is safe: it does not appear in chain IDs, addresses, or symbols.
+    token_ref = remember_token_ref(chat_id, token_key)
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(label("price_change", "Price Change"),
-                              callback_data=f"pref|price_change|{token_key}")],
+                              callback_data=f"pref|price_change|{token_ref}")],
         [InlineKeyboardButton(label("volume_spike", "Volume Spike"),
-                              callback_data=f"pref|volume_spike|{token_key}")],
+                              callback_data=f"pref|volume_spike|{token_ref}")],
         [InlineKeyboardButton(label("liquidity_change", "Liquidity Change"),
-                              callback_data=f"pref|liquidity_change|{token_key}")],
+                              callback_data=f"pref|liquidity_change|{token_ref}")],
         [InlineKeyboardButton(label("unusual_activity", "Unusual Activity"),
-                              callback_data=f"pref|unusual_activity|{token_key}")],
-        [InlineKeyboardButton("🗑 Stop Tracking", callback_data=f"track_remove:{token_key}")],
+                              callback_data=f"pref|unusual_activity|{token_ref}")],
+        [InlineKeyboardButton("🗑 Stop Tracking", callback_data=f"track_remove:{token_ref}")],
         [InlineKeyboardButton("⬅️ Back", callback_data="my_tokens")],
     ])
 
 
-def tracked_token_action_menu(token_key: str) -> InlineKeyboardMarkup:
+def tracked_token_action_menu(chat_id: int, token_key: str) -> InlineKeyboardMarkup:
+    token_ref = remember_token_ref(chat_id, token_key)
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("⚙️ Manage Alerts", callback_data=f"manage_alerts:{token_key}")],
-        [InlineKeyboardButton("🗑 Remove from List", callback_data=f"track_remove_confirm:{token_key}")],
+        [InlineKeyboardButton("⚙️ Manage Alerts", callback_data=f"manage_alerts:{token_ref}")],
+        [InlineKeyboardButton("🗑 Remove from List", callback_data=f"track_remove_confirm:{token_ref}")],
         [InlineKeyboardButton("📋 My Tracked Tokens", callback_data="my_tokens")],
         [InlineKeyboardButton("⬅️ Main Menu", callback_data="back_main")],
     ])
 
 
-def token_delete_confirm_menu(token_key: str) -> InlineKeyboardMarkup:
+def token_delete_confirm_menu(chat_id: int, token_key: str) -> InlineKeyboardMarkup:
+    token_ref = remember_token_ref(chat_id, token_key)
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("⚙️ Manage Alerts", callback_data=f"manage_alerts:{token_key}")],
+        [InlineKeyboardButton("⚙️ Manage Alerts", callback_data=f"manage_alerts:{token_ref}")],
         [
-            InlineKeyboardButton("✅ Yes, Delete", callback_data=f"track_remove:{token_key}"),
+            InlineKeyboardButton("✅ Yes, Delete", callback_data=f"track_remove:{token_ref}"),
             InlineKeyboardButton("❌ No", callback_data="back_main"),
         ],
     ])
@@ -914,7 +938,8 @@ def my_tokens_menu(chat_id: int) -> InlineKeyboardMarkup:
     rows = []
     for t in tracked:
         label = f"{t['symbol']} ({t['chain'].upper()})"
-        rows.append([InlineKeyboardButton(label, callback_data=f"token_detail|{t['token_key']}")])
+        token_ref = remember_token_ref(chat_id, t["token_key"])
+        rows.append([InlineKeyboardButton(label, callback_data=f"token_detail|{token_ref}")])
     rows.append([InlineKeyboardButton("⬅️ Back", callback_data="back_main")])
     return InlineKeyboardMarkup(rows)
 
@@ -1598,7 +1623,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"📌 Do you want to add *{escape_markdown(symbol, version=1)}* to your tracked list?",
             parse_mode="Markdown",
-            reply_markup=track_prompt_menu(token_key),
+            reply_markup=track_prompt_menu(cid, token_key),
         )
     else:
         await update.message.reply_text(
@@ -1904,7 +1929,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # (to remove the "tap a token" list message), isolated in its own try block
     # that CANNOT affect the main response delivery.
     if data.startswith("token_detail|"):
-        token_key = data.split("|", 1)[1]
+        token_ref = data.split("|", 1)[1]
+        token_key = resolve_token_ref(cid, token_ref)
         log.info(f"token_detail: cid={cid}, token_key={token_key!r}")
         entry = db.get_tracked_token(cid, token_key)
         if not entry:
@@ -1927,13 +1953,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
         try:
-            await query.edit_message_text(text, parse_mode="Markdown", reply_markup=token_delete_confirm_menu(token_key))
+            await query.edit_message_text(text, parse_mode="Markdown", reply_markup=token_delete_confirm_menu(cid, token_key))
         except Exception:
-            await context.bot.send_message(cid, text, parse_mode="Markdown", reply_markup=token_delete_confirm_menu(token_key))
+            await context.bot.send_message(cid, text, parse_mode="Markdown", reply_markup=token_delete_confirm_menu(cid, token_key))
         return
 
     if data.startswith("manage_alerts:"):
-        token_key = data.split(":", 1)[1]
+        token_ref = data.split(":", 1)[1]
+        token_key = resolve_token_ref(cid, token_ref)
         entry = db.get_tracked_token(cid, token_key)
 
         if not entry:
@@ -1972,7 +1999,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data.startswith("track_remove_confirm:"):
-        token_key = data.split(":", 1)[1]
+        token_ref = data.split(":", 1)[1]
+        token_key = resolve_token_ref(cid, token_ref)
         entry = db.get_tracked_token(cid, token_key)
         symbol_safe = escape_markdown(str((entry or {}).get("symbol", token_key)), version=1)
         text = (
@@ -1981,14 +2009,15 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Press *No* to return to the main menu."
         )
         try:
-            await query.edit_message_text(text, parse_mode="Markdown", reply_markup=token_delete_confirm_menu(token_key))
+            await query.edit_message_text(text, parse_mode="Markdown", reply_markup=token_delete_confirm_menu(cid, token_key))
         except Exception:
-            await context.bot.send_message(cid, text, parse_mode="Markdown", reply_markup=token_delete_confirm_menu(token_key))
+            await context.bot.send_message(cid, text, parse_mode="Markdown", reply_markup=token_delete_confirm_menu(cid, token_key))
         return
 
     # ── track_add ──────────────────────────────────────────────────────────
     if data.startswith("track_add:"):
-        token_key = data.split(":", 1)[1]
+        token_ref = data.split(":", 1)[1]
+        token_key = resolve_token_ref(cid, token_ref)
         pending = context.user_data.get("pending_track") or {}
         symbol = pending.get("symbol", token_key)
         name = pending.get("name", symbol)
@@ -2002,7 +2031,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 cid,
                 text,
                 parse_mode="Markdown",
-                reply_markup=tracked_token_action_menu(token_key),
+                reply_markup=tracked_token_action_menu(cid, token_key),
             )
             try:
                 await query.edit_message_reply_markup(reply_markup=None)
@@ -2032,7 +2061,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             cid,
             text,
             parse_mode="Markdown",
-            reply_markup=tracked_token_action_menu(token_key),
+            reply_markup=tracked_token_action_menu(cid, token_key),
         )
         try:
             await query.edit_message_text(
@@ -2049,7 +2078,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ── track_skip ─────────────────────────────────────────────────────────
     if data.startswith("track_skip:"):
-        token_key = data.split(":", 1)[1]
+        token_ref = data.split(":", 1)[1]
+        token_key = resolve_token_ref(cid, token_ref)
         entry = db.get_tracked_token(cid, token_key)
 
         if entry:
@@ -2062,7 +2092,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 cid,
                 text,
                 parse_mode="Markdown",
-                reply_markup=tracked_token_action_menu(token_key),
+                reply_markup=tracked_token_action_menu(cid, token_key),
             )
             try:
                 await query.edit_message_reply_markup(reply_markup=None)
@@ -2088,7 +2118,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ── track_remove ───────────────────────────────────────────────────────
     if data.startswith("track_remove:"):
-        token_key = data.split(":", 1)[1]
+        token_ref = data.split(":", 1)[1]
+        token_key = resolve_token_ref(cid, token_ref)
         entry = db.get_tracked_token(cid, token_key)
         symbol = entry["symbol"] if entry else token_key
         db.untrack_token(cid, token_key)
@@ -2125,7 +2156,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        _, pref, token_key = parts
+        _, pref, token_ref = parts
+        token_key = resolve_token_ref(cid, token_ref)
         log.info(f"pref toggle: cid={cid}, pref={pref!r}, token_key={token_key!r}")
 
         entry = db.get_tracked_token(cid, token_key)
@@ -2595,6 +2627,7 @@ try:
 except Exception as e:
     log.warning(f"Could not start job queue: {e}")
 
-log.info("=== DEPLOY MARKER V6-UI-PREMIUM-ALPHA ===")
+log.info("=== DEPLOY MARKER V8-CALLBACK-REF ===")
 log.info("Quantara UI premium alpha running...")
 app.run_polling()
+
