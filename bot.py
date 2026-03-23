@@ -24,7 +24,7 @@ from telegram.ext import (
     filters,
 )
 from telegram.helpers import escape_markdown
-print("=== DEPLOY MARKER V8-CALLBACK-REF ===")
+print("=== DEPLOY MARKER V9-ROBUST-CALLBACKS ===")
 import requests
 from datetime import datetime, timedelta
 import json
@@ -830,7 +830,12 @@ def remember_token_ref(chat_id: int, token_key: str) -> str:
     user = db.get_user(chat_id)
     mapping = user.setdefault("callback_token_map", {})
     ref = make_token_ref(token_key)
-    mapping[ref] = token_key
+    if mapping.get(ref) != token_key:
+        mapping[ref] = token_key
+        try:
+            db.save()
+        except Exception:
+            pass
     return ref
 
 
@@ -838,6 +843,29 @@ def resolve_token_ref(chat_id: int, token_ref: str) -> str:
     user = db.get_user(chat_id)
     mapping = user.get("callback_token_map", {}) or {}
     return mapping.get(token_ref, token_ref)
+
+
+def resolve_token_ref_robust(chat_id: int, token_ref: str, context=None) -> str:
+    """Resolve short callback refs reliably even after partial state loss.
+    Falls back to pending_track and all tracked tokens by recomputing refs.
+    """
+    token_key = resolve_token_ref(chat_id, token_ref)
+    if token_key != token_ref:
+        return token_key
+
+    if context is not None:
+        pending = (getattr(context, "user_data", None) or {}).get("pending_track") or {}
+        pending_key = pending.get("token_key")
+        if pending_key and make_token_ref(pending_key) == token_ref:
+            return pending_key
+
+    for entry in db.get_tracked(chat_id):
+        tk = entry.get("token_key")
+        if tk and make_token_ref(tk) == token_ref:
+            remember_token_ref(chat_id, tk)
+            return tk
+
+    return token_ref
 
 
 # ─────────────────────────────────────────────
@@ -1930,9 +1958,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # that CANNOT affect the main response delivery.
     if data.startswith("token_detail|"):
         token_ref = data.split("|", 1)[1]
-        token_key = resolve_token_ref(cid, token_ref)
+        token_key = resolve_token_ref_robust(cid, token_ref, context)
         log.info(f"token_detail: cid={cid}, token_key={token_key!r}")
         entry = db.get_tracked_token(cid, token_key)
+        if not entry:
+            tracked_now = db.get_tracked(cid)
+            if len(tracked_now) == 1:
+                token_key = tracked_now[0].get("token_key")
+                entry = db.get_tracked_token(cid, token_key)
         if not entry:
             await context.bot.send_message(
                 chat_id=cid,
@@ -1960,8 +1993,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data.startswith("manage_alerts:"):
         token_ref = data.split(":", 1)[1]
-        token_key = resolve_token_ref(cid, token_ref)
+        token_key = resolve_token_ref_robust(cid, token_ref, context)
         entry = db.get_tracked_token(cid, token_key)
+        if not entry:
+            tracked_now = db.get_tracked(cid)
+            if len(tracked_now) == 1:
+                token_key = tracked_now[0].get("token_key")
+                entry = db.get_tracked_token(cid, token_key)
 
         if not entry:
             await context.bot.send_message(
@@ -2000,7 +2038,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data.startswith("track_remove_confirm:"):
         token_ref = data.split(":", 1)[1]
-        token_key = resolve_token_ref(cid, token_ref)
+        token_key = resolve_token_ref_robust(cid, token_ref, context)
         entry = db.get_tracked_token(cid, token_key)
         symbol_safe = escape_markdown(str((entry or {}).get("symbol", token_key)), version=1)
         text = (
@@ -2017,8 +2055,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ── track_add ──────────────────────────────────────────────────────────
     if data.startswith("track_add:"):
         token_ref = data.split(":", 1)[1]
-        token_key = resolve_token_ref(cid, token_ref)
+        token_key = resolve_token_ref_robust(cid, token_ref, context)
         pending = context.user_data.get("pending_track") or {}
+        if (not token_key or token_key == token_ref) and pending.get("token_key"):
+            token_key = pending.get("token_key")
         symbol = pending.get("symbol", token_key)
         name = pending.get("name", symbol)
         chain = pending.get("chain", parse_token_key(token_key)[0] or "bsc")
@@ -2079,7 +2119,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ── track_skip ─────────────────────────────────────────────────────────
     if data.startswith("track_skip:"):
         token_ref = data.split(":", 1)[1]
-        token_key = resolve_token_ref(cid, token_ref)
+        token_key = resolve_token_ref_robust(cid, token_ref, context)
         entry = db.get_tracked_token(cid, token_key)
 
         if entry:
@@ -2119,7 +2159,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ── track_remove ───────────────────────────────────────────────────────
     if data.startswith("track_remove:"):
         token_ref = data.split(":", 1)[1]
-        token_key = resolve_token_ref(cid, token_ref)
+        token_key = resolve_token_ref_robust(cid, token_ref, context)
         entry = db.get_tracked_token(cid, token_key)
         symbol = entry["symbol"] if entry else token_key
         db.untrack_token(cid, token_key)
@@ -2157,7 +2197,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         _, pref, token_ref = parts
-        token_key = resolve_token_ref(cid, token_ref)
+        token_key = resolve_token_ref_robust(cid, token_ref, context)
         log.info(f"pref toggle: cid={cid}, pref={pref!r}, token_key={token_key!r}")
 
         entry = db.get_tracked_token(cid, token_key)
@@ -2627,7 +2667,6 @@ try:
 except Exception as e:
     log.warning(f"Could not start job queue: {e}")
 
-log.info("=== DEPLOY MARKER V8-CALLBACK-REF ===")
+log.info("=== DEPLOY MARKER V9-ROBUST-CALLBACKS ===")
 log.info("Quantara UI premium alpha running...")
 app.run_polling()
-
