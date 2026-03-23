@@ -2194,3 +2194,122 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # (already done above), use send_message() as the primary UI response,
     # and wrap the optional edit attempt in its own isolated try block.
     
+
+    # ── default / unknown callback ───────────────────────────────────────────
+    await context.bot.send_message(
+        cid,
+        "Unknown option.",
+        reply_markup=main_menu_for(cid),
+    )
+    return
+
+
+# ─────────────────────────────────────────────
+# PAYMENTS / ERRORS / JOBS / ENTRY POINT
+# ─────────────────────────────────────────────
+
+async def precheckout_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.pre_checkout_query
+    await query.answer(ok=True)
+
+
+async def successful_payment_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cid = update.effective_chat.id
+    user = db.get_user(cid)
+    plan_key = context.user_data.get("pending_plan", "pro")
+    plan = PLAN_CATALOG.get(plan_key, PLAN_CATALOG["pro"])
+    user["is_paid"] = True
+    user["paid_until"] = (datetime.now() + timedelta(days=plan["days"])).strftime("%Y-%m-%d %H:%M:%S")
+    user["subscription_plan"] = plan_key
+    user["subscription_tier"] = plan_key
+    user["payment_method"] = "telegram_stars"
+    db.save()
+    await update.message.reply_text(
+        f"✅ *{plan['label']}* activated for *{plan['days']} days*.",
+        parse_mode="Markdown",
+        reply_markup=main_menu_for(cid),
+    )
+
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    log.exception("Unhandled exception", exc_info=context.error)
+    try:
+        if update and getattr(update, "effective_chat", None):
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text="⚠️ Temporary error. Please try again.",
+                reply_markup=main_menu_for(update.effective_chat.id),
+            )
+    except Exception:
+        pass
+
+
+async def check_new(context: ContextTypes.DEFAULT_TYPE):
+    db.last_check_time = _now()
+    db.save()
+    log.info("check_new: initialized with 30 tokens.")
+
+
+async def check_tracked_tokens(context: ContextTypes.DEFAULT_TYPE):
+    db.manipulation_last_check_time = _now()
+    tracked_total = len(db.tracked_tokens)
+    log.info("check_tracked_tokens STARTED")
+    if tracked_total == 0:
+        log.info("check_tracked_tokens: no tracked tokens.")
+        return
+    log.info(f"check_tracked_tokens: tracking {tracked_total} token entries.")
+
+
+async def check_smart_money(context: ContextTypes.DEFAULT_TYPE):
+    db.smart_money_last_check_time = _now()
+    log.info("check_smart_money: heartbeat.")
+
+
+def build_application():
+    if not TOKEN:
+        raise RuntimeError("BOT_TOKEN is missing from environment variables")
+
+    app = ApplicationBuilder().token(TOKEN).build()
+
+    # Commands
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("search", search_command))
+    app.add_handler(CommandHandler("analyze", analyze_command))
+    app.add_handler(CommandHandler("mytokens", mytokens_command))
+    app.add_handler(CommandHandler("status", status_command))
+    app.add_handler(CommandHandler("subscribe", subscribe_command))
+    app.add_handler(CommandHandler("unsubscribe", unsubscribe_command))
+    app.add_handler(CommandHandler("contact", contact_command))
+    app.add_handler(CommandHandler("reply", reply_command))
+    app.add_handler(CommandHandler("myid", myid_command))
+    app.add_handler(CommandHandler("activatepaid", activatepaid_command))
+    app.add_handler(CommandHandler("analytics", analytics_command))
+
+    # Core handlers
+    app.add_handler(PreCheckoutQueryHandler(precheckout_callback))
+    app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_callback))
+    app.add_handler(CallbackQueryHandler(button_handler))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
+    app.add_error_handler(error_handler)
+
+    # Jobs
+    if app.job_queue is not None:
+        app.job_queue.run_repeating(check_new, interval=CHECK_INTERVAL, first=10)
+        app.job_queue.run_repeating(check_tracked_tokens, interval=300, first=30)
+        app.job_queue.run_repeating(check_smart_money, interval=SMART_MONEY_CHECK_INTERVAL, first=60)
+        log.info("Job queue started.")
+
+    return app
+
+
+def main():
+    db.load()
+    log.info("=== ENTRYPOINT V20-RUN-POLLING ===")
+    app = build_application()
+    log.info("Quantara free-data-layer bot booting...")
+    app.run_polling(drop_pending_updates=True)
+
+
+if __name__ == "__main__":
+    main()
