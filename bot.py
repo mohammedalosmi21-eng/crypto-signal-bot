@@ -31,7 +31,7 @@ FIXES in this version (V10 — callback resolution):
   are visible in production logs.
 """
 
-print("=== DEPLOY MARKER V19-FREE-DATA-LAYER ===")
+print("=== DEPLOY MARKER V22-GROQ-OPENROUTER-AI ===")
 
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, LabeledPrice
@@ -88,6 +88,17 @@ DATA_FILE = "bot_data.json"
 BSCSCAN_API_KEY = os.getenv("BSCSCAN_API_KEY", "")  # optional, not required for the free data layer
 BNB_RPC_URL = os.getenv("BNB_RPC_URL", "https://bsc-dataseed.bnbchain.org")
 GECKO_TERMINAL_BASE = os.getenv("GECKO_TERMINAL_BASE", "https://api.geckoterminal.com/api/v2")
+
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
+AI_PRIMARY_PROVIDER = os.getenv("AI_PRIMARY_PROVIDER", "groq").strip().lower()
+AI_FALLBACK_PROVIDER = os.getenv("AI_FALLBACK_PROVIDER", "openrouter").strip().lower()
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "openai/gpt-oss-20b:free")
+OPENROUTER_SITE_URL = os.getenv("OPENROUTER_SITE_URL", "")
+OPENROUTER_APP_NAME = os.getenv("OPENROUTER_APP_NAME", "Quantara")
+AI_REQUEST_TIMEOUT = int(os.getenv("AI_REQUEST_TIMEOUT", "25"))
+AI_MAX_OUTPUT_TOKENS = int(os.getenv("AI_MAX_OUTPUT_TOKENS", "300"))
 SMART_MONEY_CHECK_INTERVAL = 180
 SMART_MONEY_MIN_TOKEN_VALUE_USD = 1000.0
 SMART_MONEY_WALLETS = [
@@ -412,6 +423,123 @@ def build_alpha_summary(pair: dict, premium: bool = False) -> str:
     return text
 
 
+
+
+
+def _pair_snapshot_for_ai(pair: dict) -> dict:
+    base = pair.get("baseToken") or {}
+    c = alpha_components(pair)
+    return {
+        "symbol": str(base.get("symbol") or "?"),
+        "name": str(base.get("name") or "?"),
+        "chain": str(pair.get("chainId") or "?").upper(),
+        "dex": str(pair.get("dexId") or "?"),
+        "price_usd": str(pair.get("priceUsd") or "N/A"),
+        "price_change_24h": safe_float((pair.get("priceChange") or {}).get("h24")),
+        "liquidity_usd": safe_float((pair.get("liquidity") or {}).get("usd")),
+        "volume_24h_usd": safe_float((pair.get("volume") or {}).get("h24")),
+        "buys_24h": int(((pair.get("txns") or {}).get("h24") or {}).get("buys") or 0),
+        "sells_24h": int(((pair.get("txns") or {}).get("h24") or {}).get("sells") or 0),
+        "alpha_score": c["alpha"],
+        "risk_score": c["risk"],
+        "grade": c["grade"],
+        "probability": c["probability"],
+        "verdict": c["verdict"],
+        "action": c["action"],
+        "notes": c["notes"][:4],
+    }
+
+
+def build_ai_prompt(pair: dict) -> str:
+    snap = _pair_snapshot_for_ai(pair)
+    return (
+        "You are a crypto trading signal explainer. "
+        "Write a concise trader-friendly insight in English only. "
+        "Do not mention that you are an AI. "
+        "Be concrete, practical, and conservative. "
+        "Return exactly these sections with short content:\n"
+        "Bias:\nRisk:\nWhat matters now:\nTrade stance:\n\n"
+        f"Token data: {json.dumps(snap, ensure_ascii=False)}"
+    )
+
+
+def _normalize_ai_text(text: str) -> str:
+    cleaned = (text or "").strip()
+    if not cleaned:
+        return ""
+    cleaned = cleaned.replace("**", "*")
+    if len(cleaned) > 3500:
+        cleaned = cleaned[:3500].rstrip() + "\n\n…"
+    return cleaned
+
+
+def call_groq_ai(prompt: str) -> str:
+    if not GROQ_API_KEY:
+        raise RuntimeError("GROQ_API_KEY is not configured")
+    url = "https://api.groq.com/openai/v1/chat/completions"
+    payload = {
+        "model": GROQ_MODEL,
+        "messages": [
+            {"role": "system", "content": "You explain crypto signals clearly for traders."},
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0.3,
+        "max_tokens": AI_MAX_OUTPUT_TOKENS,
+    }
+    headers = {
+        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    r = requests.post(url, headers=headers, json=payload, timeout=AI_REQUEST_TIMEOUT)
+    r.raise_for_status()
+    data = r.json()
+    return _normalize_ai_text((((data.get("choices") or [{}])[0].get("message") or {}).get("content") or ""))
+
+
+def call_openrouter_ai(prompt: str) -> str:
+    if not OPENROUTER_API_KEY:
+        raise RuntimeError("OPENROUTER_API_KEY is not configured")
+    url = "https://openrouter.ai/api/v1/chat/completions"
+    payload = {
+        "model": OPENROUTER_MODEL,
+        "messages": [
+            {"role": "system", "content": "You explain crypto signals clearly for traders."},
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0.3,
+        "max_tokens": AI_MAX_OUTPUT_TOKENS,
+    }
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    if OPENROUTER_SITE_URL:
+        headers["HTTP-Referer"] = OPENROUTER_SITE_URL
+    if OPENROUTER_APP_NAME:
+        headers["X-Title"] = OPENROUTER_APP_NAME
+    r = requests.post(url, headers=headers, json=payload, timeout=AI_REQUEST_TIMEOUT)
+    r.raise_for_status()
+    data = r.json()
+    return _normalize_ai_text((((data.get("choices") or [{}])[0].get("message") or {}).get("content") or ""))
+
+
+def generate_ai_insight(pair: dict) -> tuple[str, str]:
+    prompt = build_ai_prompt(pair)
+    providers = [AI_PRIMARY_PROVIDER, AI_FALLBACK_PROVIDER]
+    tried = []
+    for provider in providers:
+        if not provider or provider in tried:
+            continue
+        tried.append(provider)
+        try:
+            if provider == "groq":
+                return call_groq_ai(prompt), "groq"
+            if provider == "openrouter":
+                return call_openrouter_ai(prompt), "openrouter"
+        except Exception as e:
+            log.warning(f"AI provider {provider} failed: {e}")
+            continue
+    raise RuntimeError("No AI provider returned a response. Configure GROQ_API_KEY and/or OPENROUTER_API_KEY.")
 # ─────────────────────────────────────────────
 # RUNTIME STATE
 # ─────────────────────────────────────────────
@@ -1017,7 +1145,8 @@ def main_menu_for(chat_id: int) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(f"⏱ Alert Mode: {mode_label}", callback_data="alert_mode_menu")],
         [InlineKeyboardButton(sm_label, callback_data=sm_data)],
         [InlineKeyboardButton(manip_label, callback_data=manip_data)],
-        [InlineKeyboardButton("🧬 Alpha Lab", callback_data="alpha_lab"), InlineKeyboardButton("⚙️ Custom Filters", callback_data="custom_filters")],
+        [InlineKeyboardButton("🧬 Alpha Lab", callback_data="alpha_lab"), InlineKeyboardButton("🤖 AI Insight", callback_data="ai_insight")],
+        [InlineKeyboardButton("⚙️ Custom Filters", callback_data="custom_filters")],
         [InlineKeyboardButton("💎 Upgrade", callback_data="subscribe_info"), InlineKeyboardButton("📊 Status", callback_data="status")],
         [InlineKeyboardButton("💬 Contact Developer", callback_data="contact_prompt"), InlineKeyboardButton("❓ Help", callback_data="help")],
     ])
@@ -1324,7 +1453,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• 🐋 Smart Money\n"
         "• ⚠️ Manipulation Detection\n"
         "• 📡 Real-time Signals\n"
-        "• 🧬 Alpha Lab\n"
+        "• 🧬 Alpha Lab\n• 🤖 AI Insight\n"
         "• ⚙️ Custom Filters\n\n"
         "Choose an option below:"
     )
@@ -1344,13 +1473,13 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/mytokens — view your tracked tokens\n"
         "/status — bot status\n"
         "/analytics — owner-only metrics\n"
-        "/myid — show your chat ID\n\n"
+        "/myid — show your chat ID\n/aiinsight — trader-style AI explanation for the last scan\n\n"
         "*Core flow:*\n"
         "1) Use `/search` or the Search button\n"
         "2) Send token name / symbol / contract\n"
         "3) Get a signal scan\n"
         "4) Choose whether to track the token\n"
-        "5) Add it to My Tokens or remove it later\n\n"
+        "5) Add it to My Tokens or remove it later\n6) Use *AI Insight* for a trader-style explanation\n\n"
         "*Alert Modes:*\n"
         "🔥 *New Token Alerts* — optional broadcast of fresh tokens that pass the filter.\n"
         "🐋 *Smart Money Alerts* — optional alerts from tracked smart-money wallets on BSC, including smart-wallet count and cluster strength.\n"
@@ -1556,6 +1685,40 @@ async def activatepaid_command(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def analyze_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await search_command(update, context)
+
+
+
+async def aiinsight_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cid = update.effective_chat.id
+    db.touch_user(cid)
+    pair = context.user_data.get("last_pair")
+    if not pair:
+        await update.message.reply_text(
+            "🤖 AI Insight needs a recent token scan first. Use /search or Prices / Search, then run /aiinsight.",
+            reply_markup=main_menu_for(cid),
+        )
+        return
+    waiting = await update.message.reply_text("🤖 Generating AI insight...")
+    try:
+        insight, provider = generate_ai_insight(pair)
+        text = f"🤖 *AI Insight*\nProvider: *{escape_markdown(provider, version=1)}*\n\n{escape_markdown(insight, version=1)}"
+        await context.bot.send_message(
+            cid,
+            text,
+            parse_mode="Markdown",
+            reply_markup=main_menu_for(cid),
+        )
+    except Exception as e:
+        await context.bot.send_message(
+            cid,
+            f"❌ AI insight is unavailable right now.\n\nReason: `{escape_markdown(str(e), version=1)}`",
+            parse_mode="Markdown",
+            reply_markup=main_menu_for(cid),
+        )
+    try:
+        await waiting.delete()
+    except Exception:
+        pass
 
 
 async def subscribe_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1806,6 +1969,50 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             await context.bot.send_message(cid, text, parse_mode="Markdown", reply_markup=(premium_gate_menu() if not premium else main_menu_for(cid)))
         return
+
+
+if data == "ai_insight":
+    last_pair = context.user_data.get("last_pair")
+    if not last_pair:
+        await context.bot.send_message(
+            cid,
+            "🤖 AI Insight needs a recent token scan first. Use *Prices / Search* and scan a token.",
+            parse_mode="Markdown",
+            reply_markup=main_menu_for(cid),
+        )
+        return
+    wait_msg = None
+    try:
+        wait_msg = await context.bot.send_message(cid, "🤖 Generating AI insight...")
+    except Exception:
+        pass
+    try:
+        insight, provider = generate_ai_insight(last_pair)
+        response_text = (
+            f"🤖 *AI Insight*\n"
+            f"Provider: *{escape_markdown(provider, version=1)}*\n\n"
+            f"{escape_markdown(insight, version=1)}"
+        )
+        await context.bot.send_message(
+            cid,
+            response_text,
+            parse_mode="Markdown",
+            reply_markup=main_menu_for(cid),
+        )
+    except Exception as e:
+        await context.bot.send_message(
+            cid,
+            f"❌ AI insight is unavailable right now.\n\nReason: `{escape_markdown(str(e), version=1)}`",
+            parse_mode="Markdown",
+            reply_markup=main_menu_for(cid),
+        )
+    finally:
+        if wait_msg is not None:
+            try:
+                await wait_msg.delete()
+            except Exception:
+                pass
+    return
 
     if data == "custom_filters":
         if not feature_allowed(cid, "custom_filters"):
@@ -2285,6 +2492,7 @@ def build_application():
     app.add_handler(CommandHandler("myid", myid_command))
     app.add_handler(CommandHandler("activatepaid", activatepaid_command))
     app.add_handler(CommandHandler("analytics", analytics_command))
+    app.add_handler(CommandHandler("aiinsight", aiinsight_command))
 
     # Core handlers
     app.add_handler(PreCheckoutQueryHandler(precheckout_callback))
@@ -2305,9 +2513,9 @@ def build_application():
 
 def main():
     db.load()
-    log.info("=== ENTRYPOINT V20-RUN-POLLING ===")
+    log.info("=== ENTRYPOINT V22-GROQ-OPENROUTER ===")
     app = build_application()
-    log.info("Quantara free-data-layer bot booting...")
+    log.info("Quantara free-data-layer bot booting with Groq primary + OpenRouter fallback AI insight...")
     app.run_polling(drop_pending_updates=True)
 
 
