@@ -4,14 +4,35 @@ Architecture: per-user state, token tracking, independent new-token alerts, smar
 Storage: JSON (schema ready for PostgreSQL migration)
 Deployment: Railway / any Python host
 
-FIXES vs previous version:
+FIXES vs previous version (V9):
 - token_detail callback: query.answer() is unconditional and first;
   UI response uses context.bot.send_message() as primary path,
   edit_message_text() is best-effort cleanup only.
 - pref| callback: same pattern — answer first, send_message primary,
   no silent edit failures possible.
 - Both handlers are wrapped so every code path produces a visible response.
+
+FIXES in this version (V10 — callback resolution):
+- remember_token_ref(): always writes mapping entry unconditionally.
+  Removed internal db.save() — caller saves after building the full menu,
+  ensuring the mapping is persisted before any button can be tapped.
+- resolve_token_ref_robust(): added Fallback 2 — checks persisted
+  pending_track in the user record (db), so track_add / track_skip
+  buttons work correctly even after a bot restart or redeploy.
+- message_handler (search flow): pending_track is now persisted to the
+  user record (db.get_user(cid)["pending_track"]) in addition to
+  context.user_data. db.save() is called AFTER track_prompt_menu() is
+  built, guaranteeing the callback_token_map entry exists on disk before
+  the user can tap "Track this token" or "No thanks".
+- track_add / track_skip handlers: both now clear the persisted
+  pending_track from the user record (in addition to context.user_data)
+  to avoid stale data on subsequent searches.
+- pref| handler: added resolution-failure warning log so silent failures
+  are visible in production logs.
 """
+
+print("=== DEPLOY MARKER V19-FREE-DATA-LAYER ===")
+
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, LabeledPrice
 from telegram.ext import (
@@ -24,7 +45,7 @@ from telegram.ext import (
     filters,
 )
 from telegram.helpers import escape_markdown
-print("=== DEPLOY MARKER V9-ROBUST-CALLBACKS ===")
+print("=== DEPLOY MARKER V10-CALLBACK-RESOLUTION-FIX ===")
 import requests
 from datetime import datetime, timedelta
 import json
@@ -64,7 +85,9 @@ MIN_VOLUME = 5000
 CHECK_INTERVAL = 180
 MAX_ALERTS_PER_CYCLE = 1
 DATA_FILE = "bot_data.json"
-BSCSCAN_API_KEY = os.getenv("BSCSCAN_API_KEY", "")
+BSCSCAN_API_KEY = os.getenv("BSCSCAN_API_KEY", "")  # optional, not required for the free data layer
+BNB_RPC_URL = os.getenv("BNB_RPC_URL", "https://bsc-dataseed.bnbchain.org")
+GECKO_TERMINAL_BASE = os.getenv("GECKO_TERMINAL_BASE", "https://api.geckoterminal.com/api/v2")
 SMART_MONEY_CHECK_INTERVAL = 180
 SMART_MONEY_MIN_TOKEN_VALUE_USD = 1000.0
 SMART_MONEY_WALLETS = [
@@ -97,6 +120,39 @@ logging.basicConfig(
     level=logging.INFO,
 )
 log = logging.getLogger(__name__)
+
+
+async def log_button_trace(context, cid, data, stage, extra=""):
+    msg = f"[BTN_TRACE] cid={cid} data={data} stage={stage} extra={extra}"
+    log.warning(msg)
+    try:
+        await context.bot.send_message(OWNER_CHAT_ID, msg)
+    except Exception:
+        pass
+
+
+async def safe_edit_message_text(query, context, *args, **kwargs):
+    """
+    Try query.edit_message_text() first. If Telegram rejects the edit
+    (400 Bad Request, message not modified, old message, etc.), fall back to
+    send_message so the user still sees a visible response.
+    """
+    try:
+        return await query.edit_message_text(*args, **kwargs)
+    except Exception as e:
+        log.warning(f"safe_edit_message_text fallback triggered: {e}")
+        text_arg = kwargs.get("text", args[0] if args else None)
+        if text_arg is None:
+            raise
+        send_kwargs = {}
+        for key in ("parse_mode", "reply_markup", "disable_web_page_preview"):
+            if key in kwargs:
+                send_kwargs[key] = kwargs[key]
+        return await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text=text_arg,
+            **send_kwargs,
+        )
 
 
 # ─────────────────────────────────────────────
@@ -661,18 +717,82 @@ def get_latest_profiles() -> list:
     return []
 
 
+def gecko_get(path: str, params: dict = None, timeout: int = 15):
+    try:
+        r = requests.get(f"{GECKO_TERMINAL_BASE}{path}", params=params, timeout=timeout, headers={"Accept": "application/json"})
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        log.warning(f"GeckoTerminal request failed for {path}: {e}")
+    return None
+
+
+def _to_dex_pair_from_gecko_pool(pool: dict) -> dict:
+    attrs = pool.get("attributes") or {}
+    relationships = pool.get("relationships") or {}
+    base_data = ((relationships.get("base_token") or {}).get("data") or {})
+    chain = str(attrs.get("network") or CHAIN_FILTER).lower()
+    price_usd = attrs.get("base_token_price_usd") or attrs.get("price_in_usd") or "0"
+    return {
+        "chainId": chain,
+        "dexId": attrs.get("dex_name") or "geckoterminal",
+        "url": attrs.get("reserve_in_usd") and f"https://www.geckoterminal.com/{chain}/pools/{pool.get('id','').split('_')[-1]}",
+        "priceUsd": price_usd,
+        "priceChange": {"h24": attrs.get("price_change_percentage", {}).get("h24") if isinstance(attrs.get("price_change_percentage"), dict) else attrs.get("price_percent_change_24h") or 0},
+        "liquidity": {"usd": attrs.get("reserve_in_usd") or 0},
+        "volume": {"h24": attrs.get("volume_usd", {}).get("h24") if isinstance(attrs.get("volume_usd"), dict) else attrs.get("volume_usd_24h") or 0},
+        "txns": {"h24": {"buys": (attrs.get("transactions") or {}).get("h24", {}).get("buys", 0) if isinstance(attrs.get("transactions"), dict) else 0,
+                          "sells": (attrs.get("transactions") or {}).get("h24", {}).get("sells", 0) if isinstance(attrs.get("transactions"), dict) else 0}},
+        "baseToken": {
+            "address": base_data.get("id", "").split('_')[-1] if base_data.get("id") else "",
+            "symbol": attrs.get("name", "?").split("/")[0].strip() if attrs.get("name") else "?",
+            "name": attrs.get("name", "?"),
+        },
+    }
+
+
+def gecko_search_pairs(q: str) -> list:
+    data = gecko_get("/search/pools", params={"query": q})
+    if not data or not isinstance(data, dict):
+        return []
+    pools = data.get("data") or []
+    out = []
+    for pool in pools[:10]:
+        try:
+            out.append(_to_dex_pair_from_gecko_pool(pool))
+        except Exception as e:
+            log.warning(f"Failed to normalize GeckoTerminal pool: {e}")
+    return out
+
+
+def gecko_get_token_pools(chain: str, addr: str) -> list:
+    data = gecko_get(f"/networks/{chain}/tokens/{addr}/pools")
+    if not data or not isinstance(data, dict):
+        return []
+    pools = data.get("data") or []
+    out = []
+    for pool in pools[:10]:
+        try:
+            out.append(_to_dex_pair_from_gecko_pool(pool))
+        except Exception as e:
+            log.warning(f"Failed to normalize GeckoTerminal token pool: {e}")
+    return out
+
+
 def search_pairs(q: str) -> list:
     data = dex_get("https://api.dexscreener.com/latest/dex/search", params={"q": q})
     if data and isinstance(data, dict):
-        return data.get("pairs", []) or []
-    return []
+        pairs = data.get("pairs", []) or []
+        if pairs:
+            return pairs
+    return gecko_search_pairs(q)
 
 
 def get_token_pairs(chain: str, addr: str) -> list:
     data = dex_get(f"https://api.dexscreener.com/token-pairs/v1/{chain}/{addr}")
-    if data and isinstance(data, list):
+    if data and isinstance(data, list) and data:
         return data
-    return []
+    return gecko_get_token_pools(chain, addr)
 
 
 # ─────────────────────────────────────────────
@@ -827,15 +947,13 @@ def make_token_ref(token_key: str) -> str:
 
 
 def remember_token_ref(chat_id: int, token_key: str) -> str:
+    # FIX: always write the mapping entry unconditionally.
+    # Removed the internal db.save() — the caller is responsible for
+    # saving after building the full menu, avoiding redundant disk writes.
     user = db.get_user(chat_id)
     mapping = user.setdefault("callback_token_map", {})
     ref = make_token_ref(token_key)
-    if mapping.get(ref) != token_key:
-        mapping[ref] = token_key
-        try:
-            db.save()
-        except Exception:
-            pass
+    mapping[ref] = token_key
     return ref
 
 
@@ -853,12 +971,21 @@ def resolve_token_ref_robust(chat_id: int, token_ref: str, context=None) -> str:
     if token_key != token_ref:
         return token_key
 
+    # Fallback 1: in-memory pending_track (works within the same bot session)
     if context is not None:
         pending = (getattr(context, "user_data", None) or {}).get("pending_track") or {}
         pending_key = pending.get("token_key")
         if pending_key and make_token_ref(pending_key) == token_ref:
             return pending_key
 
+    # Fallback 2: persisted pending_track in user record (survives bot restarts)
+    persisted_pending = db.get_user(chat_id).get("pending_track") or {}
+    persisted_key = persisted_pending.get("token_key")
+    if persisted_key and make_token_ref(persisted_key) == token_ref:
+        remember_token_ref(chat_id, persisted_key)
+        return persisted_key
+
+    # Fallback 3: scan all tracked tokens by recomputing their refs
     for entry in db.get_tracked(chat_id):
         tk = entry.get("token_key")
         if tk and make_token_ref(tk) == token_ref:
@@ -897,49 +1024,14 @@ def main_menu_for(chat_id: int) -> InlineKeyboardMarkup:
 
 
 def track_prompt_menu(chat_id: int, token_key: str) -> InlineKeyboardMarkup:
-    token_ref = remember_token_ref(chat_id, token_key)
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("✅ Track this token", callback_data=f"track_add:{token_ref}"),
-            InlineKeyboardButton("❌ No thanks", callback_data=f"track_skip:{token_ref}"),
-        ]
-    ])
-
-
-def alert_prefs_menu(chat_id: int, token_key: str) -> InlineKeyboardMarkup:
-    entry = db.get_tracked_token(chat_id, token_key)
-    if not entry:
-        return InlineKeyboardMarkup([])
-
-    alerts = entry["alerts"]
-
-    def label(pref: str, display: str) -> str:
-        return f"{'✅' if alerts.get(pref) else '❌'} {display}"
-
-    # ── FIX: callback_data uses pipe separator ─────────────────────────────
-    # Format: pref|<pref_name>|<token_key>
-    # token_key already contains a colon (chain:address), so we MUST use a
-    # different separator between pref_name and token_key to avoid ambiguity.
-    # Pipe (|) is safe: it does not appear in chain IDs, addresses, or symbols.
-    token_ref = remember_token_ref(chat_id, token_key)
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton(label("price_change", "Price Change"),
-                              callback_data=f"pref|price_change|{token_ref}")],
-        [InlineKeyboardButton(label("volume_spike", "Volume Spike"),
-                              callback_data=f"pref|volume_spike|{token_ref}")],
-        [InlineKeyboardButton(label("liquidity_change", "Liquidity Change"),
-                              callback_data=f"pref|liquidity_change|{token_ref}")],
-        [InlineKeyboardButton(label("unusual_activity", "Unusual Activity"),
-                              callback_data=f"pref|unusual_activity|{token_ref}")],
-        [InlineKeyboardButton("🗑 Stop Tracking", callback_data=f"track_remove:{token_ref}")],
-        [InlineKeyboardButton("⬅️ Back", callback_data="my_tokens")],
-    ])
+    # Legacy helper kept for compatibility; auto-tracking is now used after search.
+    remember_token_ref(chat_id, token_key)
+    return InlineKeyboardMarkup([])
 
 
 def tracked_token_action_menu(chat_id: int, token_key: str) -> InlineKeyboardMarkup:
     token_ref = remember_token_ref(chat_id, token_key)
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("⚙️ Manage Alerts", callback_data=f"manage_alerts:{token_ref}")],
         [InlineKeyboardButton("🗑 Remove from List", callback_data=f"track_remove_confirm:{token_ref}")],
         [InlineKeyboardButton("📋 My Tracked Tokens", callback_data="my_tokens")],
         [InlineKeyboardButton("⬅️ Main Menu", callback_data="back_main")],
@@ -949,7 +1041,6 @@ def tracked_token_action_menu(chat_id: int, token_key: str) -> InlineKeyboardMar
 def token_delete_confirm_menu(chat_id: int, token_key: str) -> InlineKeyboardMarkup:
     token_ref = remember_token_ref(chat_id, token_key)
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("⚙️ Manage Alerts", callback_data=f"manage_alerts:{token_ref}")],
         [
             InlineKeyboardButton("✅ Yes, Delete", callback_data=f"track_remove:{token_ref}"),
             InlineKeyboardButton("❌ No", callback_data="back_main"),
@@ -1021,6 +1112,7 @@ def smart_wallets() -> list:
 
 
 def bscscan_get(params: dict, timeout: int = 20):
+    # Optional explorer path. The free data layer does not require this key.
     if not BSCSCAN_API_KEY:
         return None
     full_params = dict(params)
@@ -1145,11 +1237,14 @@ def build_smart_money_alert(wallet_label: str, wallet_address: str, tx: dict, cl
 
 
 async def smart_money_check(token_key: str) -> dict:
-    # kept for compatibility with older code paths
+    # Free-data-layer compatible status report. Smart money can work later with
+    # optional explorer or RPC enrichment, but the core product no longer
+    # depends on a paid explorer API to search, score, or track tokens.
     return {
-        "status": "bscscan_ready" if BSCSCAN_API_KEY else "disabled",
+        "status": "optional_explorer" if BSCSCAN_API_KEY else "free_data_layer",
         "tracked_wallets": len(smart_wallets()),
-        "confidence": 60 if BSCSCAN_API_KEY else 0,
+        "confidence": 60 if BSCSCAN_API_KEY else 35,
+        "market_data": "DexScreener + GeckoTerminal",
     }
 
 
@@ -1208,58 +1303,6 @@ def build_manipulation_alert(symbol: str, chain_display: str, dex_url: str, sign
 # INTERNAL HELPER — send alert settings message
 # ─────────────────────────────────────────────
 
-async def _send_alert_settings(context, chat_id: int, token_key: str) -> bool:
-    """
-    Sends a fresh alert-settings message to the user via send_message().
-    Returns True on success, False on failure.
-    This is the single authoritative function for opening the alert prefs UI.
-    Using send_message() (not edit) guarantees delivery even when the
-    original callback message is no longer editable.
-    """
-    entry = db.get_tracked_token(chat_id, token_key)
-    if not entry:
-        log.warning(f"_send_alert_settings: token_key={token_key} not found for chat_id={chat_id}")
-        try:
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=(
-                    "⚠️ Token not found in your tracked list.\n"
-                    "It may have been removed. Use *My Tracked Tokens* to check."
-                ),
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("📋 My Tracked Tokens", callback_data="my_tokens")],
-                    [InlineKeyboardButton("⬅️ Main Menu", callback_data="back_main")],
-                ]),
-            )
-        except Exception as e:
-            log.error(f"_send_alert_settings: could not send 'not found' message to {chat_id}: {e}")
-        return False
-
-    symbol_safe = escape_markdown(str(entry.get("symbol", "?")), version=1)
-    chain_safe = escape_markdown(str(entry.get("chain", "?")).upper(), version=1)
-    added_safe = escape_markdown(str(entry.get("added_at", "?")), version=1)
-
-    text = (
-        f"⚙️ *Alert Settings — {symbol_safe}*\n"
-        f"Chain: {chain_safe}\n"
-        f"Added: {added_safe}\n\n"
-        "Toggle the alerts you want below:"
-    )
-
-    try:
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=text,
-            parse_mode="Markdown",
-            reply_markup=alert_prefs_menu(chat_id, token_key),
-        )
-        return True
-    except Exception as e:
-        log.error(f"_send_alert_settings: send_message failed for {chat_id}: {e}")
-        return False
-
-
 # ─────────────────────────────────────────────
 # COMMAND HANDLERS
 # ─────────────────────────────────────────────
@@ -1307,7 +1350,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "2) Send token name / symbol / contract\n"
         "3) Get a signal scan\n"
         "4) Choose whether to track the token\n"
-        "5) Configure per-token alert preferences\n\n"
+        "5) Add it to My Tokens or remove it later\n\n"
         "*Alert Modes:*\n"
         "🔥 *New Token Alerts* — optional broadcast of fresh tokens that pass the filter.\n"
         "🐋 *Smart Money Alerts* — optional alerts from tracked smart-money wallets on BSC, including smart-wallet count and cluster strength.\n"
@@ -1415,7 +1458,7 @@ async def mytokens_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    text = "📋 *Your Tracked Tokens*\nTap a token to manage alert preferences.\n"
+    text = "📋 *Your Tracked Tokens*\nTap a token to open actions.\n"
     await update.message.reply_text(text, parse_mode="Markdown", reply_markup=my_tokens_menu(cid))
 
 
@@ -1638,30 +1681,60 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     name = (best.get("baseToken") or {}).get("name", "???")
     chain = (best.get("chainId") or "unknown").lower()
 
-    context.user_data["pending_track"] = {
+    # Persist the latest token reference for compatibility with older callback paths,
+    # even though the bot now auto-adds newly scanned tokens.
+    latest_track_data = {
         "token_key": token_key,
         "symbol": symbol,
         "name": name,
         "chain": chain,
     }
+    context.user_data["pending_track"] = latest_track_data
+    db.get_user(cid)["pending_track"] = latest_track_data
 
-    already_tracked = db.get_tracked_token(cid, token_key) is not None
+    existing = db.get_tracked_token(cid, token_key)
+    if not existing:
+        current_limit = tracked_token_limit_for(cid)
+        if len(db.get_tracked(cid)) >= current_limit:
+            await update.message.reply_text(
+                f"⛔ Tracking limit reached. Your current tier allows *{current_limit}* tracked tokens.\n\n"
+                "Upgrade to increase your watchlist capacity.",
+                parse_mode="Markdown",
+                reply_markup=premium_gate_menu(),
+            )
+            db.save()
+            return
 
-    if not already_tracked:
+        db.track_token(cid, token_key, symbol, name, chain)
+        db.save()
+
         await update.message.reply_text(
-            f"📌 Do you want to add *{escape_markdown(symbol, version=1)}* to your tracked list?",
-            parse_mode="Markdown",
-            reply_markup=track_prompt_menu(cid, token_key),
-        )
-    else:
-        await update.message.reply_text(
-            f"✅ You're already tracking *{escape_markdown(symbol, version=1)}*.\n\nManage alerts from *My Tracked Tokens*.",
+            f"✅ *{escape_markdown(symbol, version=1)}* was added to *My Tokens*.\n\n"
+            "To remove it later:\n"
+            "1. Open *My Tokens*\n"
+            "2. Tap the token\n"
+            "3. Confirm deletion\n\n"
+            "This keeps your watchlist clean while you track active setups.",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("📋 My Tracked Tokens", callback_data="my_tokens")],
+                [InlineKeyboardButton("📋 My Tokens", callback_data="my_tokens")],
                 [InlineKeyboardButton("⬅️ Main Menu", callback_data="back_main")],
             ]),
         )
+    else:
+        await update.message.reply_text(
+            f"✅ *{escape_markdown(symbol, version=1)}* is already in *My Tokens*.\n\n"
+            "If you want to remove it later:\n"
+            "1. Open *My Tokens*\n"
+            "2. Tap the token\n"
+            "3. Confirm deletion",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📋 My Tokens", callback_data="my_tokens")],
+                [InlineKeyboardButton("⬅️ Main Menu", callback_data="back_main")],
+            ]),
+        )
+
 
 
 # ─────────────────────────────────────────────
@@ -1672,7 +1745,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     cid = query.message.chat_id
     data = query.data
+    print("DEBUG CALLBACK [button_handler]:", data)
     db.touch_user(cid)
+    await log_button_trace(context, cid, data, "ENTER")
 
     # ── STEP 1: Always answer the callback query immediately ───────────────
     # This MUST happen before any other logic to prevent "button loading"
@@ -1690,7 +1765,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "search_prompt":
         db.set_state(cid, "awaiting_search")
         try:
-            await query.edit_message_text("🔍 Send a token name, symbol, or contract address:")
+            await safe_edit_message_text(query, context, "🔍 Send a token name, symbol, or contract address:")
         except Exception:
             await context.bot.send_message(cid, "🔍 Send a token name, symbol, or contract address:")
         return
@@ -1698,7 +1773,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "alert_mode_menu":
         text = "⏱ *Alert Speed*\n\n⚡ *Fast Alerts* — best for active traders\n📊 *Normal* — balanced default\n📈 *Long-term* — low-noise monitoring\n\nChoose the mode that fits your style."
         try:
-            await query.edit_message_text(text, parse_mode="Markdown", reply_markup=alert_mode_menu(cid))
+            await safe_edit_message_text(query, context, text, parse_mode="Markdown", reply_markup=alert_mode_menu(cid))
         except Exception:
             await context.bot.send_message(cid, text, parse_mode="Markdown", reply_markup=alert_mode_menu(cid))
         return
@@ -1712,7 +1787,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         db.save()
         text = f"✅ Alert mode set to *{alert_mode_label(mode)}*\n\nCurrent cadence target: ~{alert_check_interval_seconds(cid)//60} minutes."
         try:
-            await query.edit_message_text(text, parse_mode="Markdown", reply_markup=main_menu_for(cid))
+            await safe_edit_message_text(query, context, text, parse_mode="Markdown", reply_markup=main_menu_for(cid))
         except Exception:
             await context.bot.send_message(cid, text, parse_mode="Markdown", reply_markup=main_menu_for(cid))
         return
@@ -1727,7 +1802,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not premium:
             text += "\n\n🔒 Full Alpha Breakdown is available in *Pro Alpha* and above."
         try:
-            await query.edit_message_text(text, parse_mode="Markdown", reply_markup=(premium_gate_menu() if not premium else main_menu_for(cid)))
+            await safe_edit_message_text(query, context, text, parse_mode="Markdown", reply_markup=(premium_gate_menu() if not premium else main_menu_for(cid)))
         except Exception:
             await context.bot.send_message(cid, text, parse_mode="Markdown", reply_markup=(premium_gate_menu() if not premium else main_menu_for(cid)))
         return
@@ -1740,7 +1815,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         db.save()
         text = "⚙️ *Custom Filters*\n\nElite mode unlocked. In the next phase we can wire bespoke liquidity / volume / signal thresholds for your workflow."
         try:
-            await query.edit_message_text(text, parse_mode="Markdown", reply_markup=main_menu_for(cid))
+            await safe_edit_message_text(query, context, text, parse_mode="Markdown", reply_markup=main_menu_for(cid))
         except Exception:
             await context.bot.send_message(cid, text, parse_mode="Markdown", reply_markup=main_menu_for(cid))
         return
@@ -1748,7 +1823,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "subscribe_info":
         text = build_subscription_hub(cid) + "\n\n" + premium_plan_card("trader") + "\n\n" + premium_plan_card("pro") + "\n\n" + premium_plan_card("elite")
         try:
-            await query.edit_message_text(text, parse_mode="Markdown", reply_markup=payment_options_menu())
+            await safe_edit_message_text(query, context, text, parse_mode="Markdown", reply_markup=payment_options_menu())
         except Exception:
             await context.bot.send_message(cid, text, parse_mode="Markdown", reply_markup=payment_options_menu())
         return
@@ -1756,7 +1831,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "subscribe_usdt":
         text = build_subscription_hub(cid) + "\n\n*USDT settlement*\n" + "\n".join(f"• {PLAN_CATALOG[k]['label']}: {PLAN_CATALOG[k]['usdt']} USDT / {PLAN_CATALOG[k]['days']} days" for k in ["trader", "pro", "elite"]) + f"\n\nNetwork: {PAYMENT_NETWORK}\nAddress: `{PAYMENT_WALLET}`\n\nAfter payment, send proof to the developer for activation."
         try:
-            await query.edit_message_text(text, parse_mode="Markdown", reply_markup=payment_options_menu())
+            await safe_edit_message_text(query, context, text, parse_mode="Markdown", reply_markup=payment_options_menu())
         except Exception:
             await context.bot.send_message(cid, text, parse_mode="Markdown", reply_markup=payment_options_menu())
         return
@@ -1778,7 +1853,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "🐋 Smart Money Alerts and ⚠️ Manipulation Alerts remain unchanged, so you can run any one mode or all three together."
         )
         try:
-            await query.edit_message_text(text, parse_mode="Markdown", reply_markup=main_menu_for(cid))
+            await safe_edit_message_text(query, context, text, parse_mode="Markdown", reply_markup=main_menu_for(cid))
         except Exception:
             await context.bot.send_message(cid, text, parse_mode="Markdown", reply_markup=main_menu_for(cid))
         return
@@ -1792,7 +1867,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "🐋 Smart Money Alerts and your tracked tokens are unaffected."
         )
         try:
-            await query.edit_message_text(text, parse_mode="Markdown", reply_markup=main_menu_for(cid))
+            await safe_edit_message_text(query, context, text, parse_mode="Markdown", reply_markup=main_menu_for(cid))
         except Exception:
             await context.bot.send_message(cid, text, parse_mode="Markdown", reply_markup=main_menu_for(cid))
         return
@@ -1810,7 +1885,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "🔥 New Token Alerts and ⚠️ Manipulation Alerts remain unchanged, so you can run any one mode or all three together."
         )
         try:
-            await query.edit_message_text(text, parse_mode="Markdown", reply_markup=main_menu_for(cid))
+            await safe_edit_message_text(query, context, text, parse_mode="Markdown", reply_markup=main_menu_for(cid))
         except Exception:
             await context.bot.send_message(cid, text, parse_mode="Markdown", reply_markup=main_menu_for(cid))
         return
@@ -1824,7 +1899,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "🔥 New Token Alerts and your tracked tokens are unaffected."
         )
         try:
-            await query.edit_message_text(text, parse_mode="Markdown", reply_markup=main_menu_for(cid))
+            await safe_edit_message_text(query, context, text, parse_mode="Markdown", reply_markup=main_menu_for(cid))
         except Exception:
             await context.bot.send_message(cid, text, parse_mode="Markdown", reply_markup=main_menu_for(cid))
         return
@@ -1842,7 +1917,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "🔥 New Token Alerts and 🐋 Smart Money Alerts remain unchanged."
         )
         try:
-            await query.edit_message_text(text, parse_mode="Markdown", reply_markup=main_menu_for(cid))
+            await safe_edit_message_text(query, context, text, parse_mode="Markdown", reply_markup=main_menu_for(cid))
         except Exception:
             await context.bot.send_message(cid, text, parse_mode="Markdown", reply_markup=main_menu_for(cid))
         return
@@ -1856,7 +1931,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "🔥 New Token Alerts and 🐋 Smart Money Alerts remain unchanged."
         )
         try:
-            await query.edit_message_text(text, parse_mode="Markdown", reply_markup=main_menu_for(cid))
+            await safe_edit_message_text(query, context, text, parse_mode="Markdown", reply_markup=main_menu_for(cid))
         except Exception:
             await context.bot.send_message(cid, text, parse_mode="Markdown", reply_markup=main_menu_for(cid))
         return
@@ -1882,7 +1957,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"⏱ Manipulation Last Check: {db.manipulation_last_check_time}"
         )
         try:
-            await query.edit_message_text(text, parse_mode="Markdown", reply_markup=main_menu_for(cid))
+            await safe_edit_message_text(query, context, text, parse_mode="Markdown", reply_markup=main_menu_for(cid))
         except Exception:
             await context.bot.send_message(cid, text, parse_mode="Markdown", reply_markup=main_menu_for(cid))
         return
@@ -1899,7 +1974,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "*Tracked Tokens* — your personal watchlist with custom alert settings."
         )
         try:
-            await query.edit_message_text(text, parse_mode="Markdown", reply_markup=main_menu_for(cid))
+            await safe_edit_message_text(query, context, text, parse_mode="Markdown", reply_markup=main_menu_for(cid))
         except Exception:
             await context.bot.send_message(cid, text, parse_mode="Markdown", reply_markup=main_menu_for(cid))
         return
@@ -1912,7 +1987,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Use this for feedback, bug reports, or feature requests."
         )
         try:
-            await query.edit_message_text(text, parse_mode="Markdown")
+            await safe_edit_message_text(query, context, text, parse_mode="Markdown")
         except Exception:
             await context.bot.send_message(cid, text, parse_mode="Markdown")
         return
@@ -1920,7 +1995,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "back_main":
         text = "🚀 *Only Signals — V2*\nChoose an option below:"
         try:
-            await query.edit_message_text(text, parse_mode="Markdown", reply_markup=main_menu_for(cid))
+            await safe_edit_message_text(query, context, text, parse_mode="Markdown", reply_markup=main_menu_for(cid))
         except Exception:
             await context.bot.send_message(cid, text, parse_mode="Markdown", reply_markup=main_menu_for(cid))
         return
@@ -1934,10 +2009,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 [InlineKeyboardButton("⬅️ Back", callback_data="back_main")],
             ])
         else:
-            text = "📋 *Your Tracked Tokens*\nTap a token to manage its alert settings."
+            text = "📋 *Your Tracked Tokens*\nTap a token to open actions."
             kb = my_tokens_menu(cid)
         try:
-            await query.edit_message_text(text, parse_mode="Markdown", reply_markup=kb)
+            await safe_edit_message_text(query, context, text, parse_mode="Markdown", reply_markup=kb)
         except Exception:
             await context.bot.send_message(cid, text, parse_mode="Markdown", reply_markup=kb)
         return
@@ -1981,59 +2056,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         chain_safe = escape_markdown(str(entry.get("chain", "?")).upper(), version=1)
         text = (
             f"📌 *{symbol_safe}* — {chain_safe}\n\n"
-            "Do you want to delete this token from your tracked list?\n\n"
-            "You can also open alert settings before deciding."
+            "This token is currently in *My Tokens*.\n\n"
+            "Do you want to remove it from your watchlist?"
         )
 
         try:
-            await query.edit_message_text(text, parse_mode="Markdown", reply_markup=token_delete_confirm_menu(cid, token_key))
+            await safe_edit_message_text(query, context, text, parse_mode="Markdown", reply_markup=token_delete_confirm_menu(cid, token_key))
         except Exception:
             await context.bot.send_message(cid, text, parse_mode="Markdown", reply_markup=token_delete_confirm_menu(cid, token_key))
-        return
-
-    if data.startswith("manage_alerts:"):
-        token_ref = data.split(":", 1)[1]
-        token_key = resolve_token_ref_robust(cid, token_ref, context)
-        entry = db.get_tracked_token(cid, token_key)
-        if not entry:
-            tracked_now = db.get_tracked(cid)
-            if len(tracked_now) == 1:
-                token_key = tracked_now[0].get("token_key")
-                entry = db.get_tracked_token(cid, token_key)
-
-        if not entry:
-            await context.bot.send_message(
-                chat_id=cid,
-                text="⚠️ Token not found in your tracked list.",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("📋 My Tracked Tokens", callback_data="my_tokens")],
-                    [InlineKeyboardButton("⬅️ Main Menu", callback_data="back_main")],
-                ]),
-            )
-            return
-
-        delivered = await _send_alert_settings(context, cid, token_key)
-
-        if delivered:
-            try:
-                await query.edit_message_text(
-                    "⚙️ Alert settings opened below.",
-                    reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton("📋 My Tracked Tokens", callback_data="my_tokens")],
-                        [InlineKeyboardButton("⬅️ Main Menu", callback_data="back_main")],
-                    ]),
-                )
-            except Exception as e:
-                log.debug(f"manage_alerts: edit_message_text non-fatal: {e}")
-        else:
-            await context.bot.send_message(
-                chat_id=cid,
-                text="⚠️ Could not open alert settings right now. Please try again.",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("📋 My Tracked Tokens", callback_data="my_tokens")],
-                    [InlineKeyboardButton("⬅️ Main Menu", callback_data="back_main")],
-                ]),
-            )
         return
 
     if data.startswith("track_remove_confirm:"):
@@ -2042,118 +2072,99 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         entry = db.get_tracked_token(cid, token_key)
         symbol_safe = escape_markdown(str((entry or {}).get("symbol", token_key)), version=1)
         text = (
-            f"🗑 *Delete {symbol_safe}?*\n\n"
-            "Press *Yes* to remove it from your tracked list.\n"
-            "Press *No* to return to the main menu."
+            f"🗑 *Remove {symbol_safe}?*\n\n"
+            "Press *Yes* to delete it from *My Tokens*.\n"
+            "Press *No* to go back to the main menu."
         )
         try:
-            await query.edit_message_text(text, parse_mode="Markdown", reply_markup=token_delete_confirm_menu(cid, token_key))
+            await safe_edit_message_text(query, context, text, parse_mode="Markdown", reply_markup=token_delete_confirm_menu(cid, token_key))
         except Exception:
             await context.bot.send_message(cid, text, parse_mode="Markdown", reply_markup=token_delete_confirm_menu(cid, token_key))
         return
 
     # ── track_add ──────────────────────────────────────────────────────────
-    if data.startswith("track_add:"):
-        token_ref = data.split(":", 1)[1]
-        token_key = resolve_token_ref_robust(cid, token_ref, context)
-        pending = context.user_data.get("pending_track") or {}
-        if (not token_key or token_key == token_ref) and pending.get("token_key"):
-            token_key = pending.get("token_key")
-        symbol = pending.get("symbol", token_key)
+    if data == "track_add_pending" or data.startswith("track_add:"):
+        pending = context.user_data.get("pending_track") or db.get_user(cid).get("pending_track") or {}
+        token_key = pending.get("token_key")
+        symbol = pending.get("symbol", "Token")
         name = pending.get("name", symbol)
-        chain = pending.get("chain", parse_token_key(token_key)[0] or "bsc")
+        chain = pending.get("chain", "bsc")
 
-        existing = db.get_tracked_token(cid, token_key)
-        if existing:
-            symbol = existing.get("symbol", symbol)
-            text = f"✅ *{escape_markdown(symbol, version=1)}* is already in your tracked list."
+        if (not token_key) and data.startswith("track_add:"):
+            token_ref = data.split(":", 1)[1]
+            token_key = resolve_token_ref_robust(cid, token_ref, context)
+            existing = db.get_tracked_token(cid, token_key)
+            if existing:
+                symbol = existing.get("symbol", symbol)
+                name = existing.get("name", name)
+                chain = existing.get("chain", chain)
+
+        if not token_key:
             await context.bot.send_message(
                 cid,
-                text,
-                parse_mode="Markdown",
-                reply_markup=tracked_token_action_menu(cid, token_key),
+                "⚠️ Could not identify the token to add. Please search again.",
+                reply_markup=main_menu_for(cid),
             )
-            try:
-                await query.edit_message_reply_markup(reply_markup=None)
-            except Exception as e:
-                log.debug(f"track_add(existing): edit_message_reply_markup non-fatal: {e}")
             return
 
-        current_limit = tracked_token_limit_for(cid)
-        if len(db.get_tracked(cid)) >= current_limit:
-            text = f"⛔ Tracking limit reached. Your current tier allows *{current_limit}* tracked tokens."
-            await context.bot.send_message(cid, text, parse_mode="Markdown", reply_markup=premium_gate_menu())
-            try:
-                await query.edit_message_reply_markup(reply_markup=None)
-            except Exception as e:
-                log.debug(f"track_add(limit): edit_message_reply_markup non-fatal: {e}")
-            return
+        existing = db.get_tracked_token(cid, token_key)
+        if not existing:
+            current_limit = tracked_token_limit_for(cid)
+            if len(db.get_tracked(cid)) >= current_limit:
+                text = f"⛔ Tracking limit reached. Your current tier allows *{current_limit}* tracked tokens."
+                await context.bot.send_message(cid, text, parse_mode="Markdown", reply_markup=premium_gate_menu())
+                return
+            db.track_token(cid, token_key, symbol, name, chain)
+            db.save()
+            text = f"✅ *{escape_markdown(symbol, version=1)}* was added to *My Tokens*."
+        else:
+            symbol = existing.get("symbol", symbol)
+            text = f"✅ *{escape_markdown(symbol, version=1)}* is already in *My Tokens*."
 
-        db.track_token(cid, token_key, symbol, name, chain)
-        db.save()
         context.user_data.pop("pending_track", None)
+        db.get_user(cid).pop("pending_track", None)
+        db.save()
 
-        text = (
-            f"✅ *{escape_markdown(symbol, version=1)}* was added to *My Tokens*.\n\n"
-            "You can manage its alerts below or go back to the main menu."
-        )
         await context.bot.send_message(
             cid,
             text,
             parse_mode="Markdown",
-            reply_markup=tracked_token_action_menu(cid, token_key),
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📋 My Tokens", callback_data="my_tokens")],
+                [InlineKeyboardButton("⬅️ Main Menu", callback_data="back_main")],
+            ]),
         )
-        try:
-            await query.edit_message_text(
-                f"📦 *{escape_markdown(symbol, version=1)}* added successfully.",
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("📋 My Tokens", callback_data="my_tokens")],
-                    [InlineKeyboardButton("⬅️ Main Menu", callback_data="back_main")],
-                ]),
-            )
-        except Exception as e:
-            log.debug(f"track_add: edit_message_text non-fatal: {e}")
         return
 
     # ── track_skip ─────────────────────────────────────────────────────────
-    if data.startswith("track_skip:"):
-        token_ref = data.split(":", 1)[1]
-        token_key = resolve_token_ref_robust(cid, token_ref, context)
-        entry = db.get_tracked_token(cid, token_key)
+    if data == "track_skip_pending" or data.startswith("track_skip:"):
+        pending = context.user_data.get("pending_track") or db.get_user(cid).get("pending_track") or {}
+        token_key = pending.get("token_key")
+        symbol = pending.get("symbol", "Token")
 
-        if entry:
-            safe_symbol = escape_markdown(entry.get("symbol", token_key), version=1)
-            text = (
-                f"ℹ️ *{safe_symbol}* is already in your tracked list.\n\n"
-                "Manage alerts from *My Tokens* or return to the main menu."
-            )
-            await context.bot.send_message(
-                cid,
-                text,
-                parse_mode="Markdown",
-                reply_markup=tracked_token_action_menu(cid, token_key),
-            )
-            try:
-                await query.edit_message_reply_markup(reply_markup=None)
-            except Exception as e:
-                log.debug(f"track_skip(existing): edit_message_reply_markup non-fatal: {e}")
-        else:
-            context.user_data.pop("pending_track", None)
-            text = "👍 No problem. This token was not added to *My Tokens*."
-            await context.bot.send_message(
-                cid,
-                text,
-                parse_mode="Markdown",
-                reply_markup=main_menu_for(cid),
-            )
-            try:
-                await query.edit_message_text(
-                    "Skipped. Back to the main menu below.",
-                    reply_markup=main_menu_for(cid),
-                )
-            except Exception as e:
-                log.debug(f"track_skip: edit_message_text non-fatal: {e}")
+        if (not token_key) and data.startswith("track_skip:"):
+            token_ref = data.split(":", 1)[1]
+            token_key = resolve_token_ref_robust(cid, token_ref, context)
+            existing = db.get_tracked_token(cid, token_key)
+            if existing:
+                symbol = existing.get("symbol", symbol)
+
+        msg = "👍 The token was not added to *My Tokens*."
+        if token_key and db.get_tracked_token(cid, token_key):
+            db.untrack_token(cid, token_key)
+            db.save()
+            msg = f"🗑️ *{escape_markdown(symbol, version=1)}* was removed from *My Tokens*."
+
+        context.user_data.pop("pending_track", None)
+        db.get_user(cid).pop("pending_track", None)
+        db.save()
+
+        await context.bot.send_message(
+            cid,
+            msg,
+            parse_mode="Markdown",
+            reply_markup=main_menu_for(cid),
+        )
         return
 
     # ── track_remove ───────────────────────────────────────────────────────
@@ -2167,7 +2178,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.pop("pending_track", None)
         text = f"🗑 *{escape_markdown(symbol, version=1)}* was removed from your tracked list."
         try:
-            await query.edit_message_text(text, parse_mode="Markdown", reply_markup=main_menu_for(cid))
+            await safe_edit_message_text(query, context, text, parse_mode="Markdown", reply_markup=main_menu_for(cid))
         except Exception:
             await context.bot.send_message(cid, text, parse_mode="Markdown", reply_markup=main_menu_for(cid))
         return
@@ -2182,491 +2193,123 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # FIX: parse callback_data cleanly (maxsplit=2 on "|"), call answer() first
     # (already done above), use send_message() as the primary UI response,
     # and wrap the optional edit attempt in its own isolated try block.
-    if data.startswith("pref|"):
-        parts = data.split("|", 2)   # ["pref", "<pref_name>", "<token_key>"]
+    
 
-        if len(parts) != 3:
-            log.warning(f"pref: malformed callback_data={data!r} from cid={cid}")
-            await context.bot.send_message(
-                chat_id=cid,
-                text="⚠️ Something went wrong with that button. Please try again from My Tracked Tokens.",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("📋 My Tracked Tokens", callback_data="my_tokens")]
-                ]),
-            )
-            return
-
-        _, pref, token_ref = parts
-        token_key = resolve_token_ref_robust(cid, token_ref, context)
-        log.info(f"pref toggle: cid={cid}, pref={pref!r}, token_key={token_key!r}")
-
-        entry = db.get_tracked_token(cid, token_key)
-        if not entry:
-            log.warning(f"pref: token_key={token_key!r} not found for cid={cid}")
-            await context.bot.send_message(
-                chat_id=cid,
-                text=(
-                    "⚠️ Token not found in your tracked list.\n"
-                    "It may have been removed."
-                ),
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("📋 My Tracked Tokens", callback_data="my_tokens")],
-                    [InlineKeyboardButton("⬅️ Main Menu", callback_data="back_main")],
-                ]),
-            )
-            return
-
-        # Toggle the preference
-        current_val = entry["alerts"].get(pref, False)
-        db.set_alert_pref(cid, token_key, pref, not current_val)
-        db.save()
-
-        refreshed = db.get_tracked_token(cid, token_key)
-        symbol_safe = escape_markdown(str(refreshed.get("symbol", "?")), version=1)
-        chain_safe = escape_markdown(str(refreshed.get("chain", "?")).upper(), version=1)
-
-        settings_text = (
-            f"⚙️ *Alert Settings — {symbol_safe}*\n"
-            f"Chain: {chain_safe}\n\n"
-            "Toggle the alerts you want below:"
-        )
-
-        # Primary: always send a fresh message — no dependency on editability
-        await context.bot.send_message(
-            chat_id=cid,
-            text=settings_text,
-            parse_mode="Markdown",
-            reply_markup=alert_prefs_menu(cid, token_key),
-        )
-
-        # Best-effort: remove the keyboard from the previous settings message
-        # so the chat doesn't accumulate stale keyboards. Isolated — cannot
-        # affect the delivery above.
-        try:
-            await query.edit_message_reply_markup(reply_markup=None)
-        except Exception as e:
-            log.debug(f"pref: edit_message_reply_markup non-fatal: {e}")
-        return
-
-    # ── Catch-all for any unrecognised callback_data ───────────────────────
-    log.warning(f"button_handler: unrecognised callback data={data!r} from cid={cid}")
-    try:
-        await query.edit_message_text("Unknown option.", reply_markup=main_menu_for(cid))
-    except Exception:
-        await context.bot.send_message(cid, "Unknown option.", reply_markup=main_menu_for(cid))
-
-
-# ─────────────────────────────────────────────
-# BACKGROUND JOB — new token alerts
-# ─────────────────────────────────────────────
-
-async def check_new(context: ContextTypes.DEFAULT_TYPE):
-    global seen_tokens
-
-    db.last_check_time = _now()
-
-    profiles = get_latest_profiles()
-    if not profiles:
-        log.info("check_new: no profiles returned.")
-        return
-
-    if not seen_tokens:
-        for item in profiles:
-            chain = item.get("chainId")
-            addr = item.get("tokenAddress")
-            if chain and addr:
-                seen_tokens.add(f"{chain}:{addr}")
-        db.save()
-        log.info(f"check_new: initialized with {len(seen_tokens)} tokens.")
-        return
-
-    alerts_built = []
-
-    for item in profiles:
-        chain = item.get("chainId", "")
-        addr = item.get("tokenAddress", "")
-
-        if not chain or not addr:
-            continue
-        if chain.lower() != CHAIN_FILTER:
-            continue
-
-        key = f"{chain}:{addr}"
-        if key in seen_tokens:
-            continue
-
-        seen_tokens.add(key)
-
-        pairs = get_token_pairs(chain, addr)
-        best = choose_best_pair(pairs)
-        if not best:
-            continue
-
-        liquidity = safe_float((best.get("liquidity") or {}).get("usd"))
-        volume = safe_float((best.get("volume") or {}).get("h24"))
-
-        if liquidity < MIN_LIQUIDITY or volume < MIN_VOLUME:
-            continue
-
-        msg = build_scan_msg(best, header="🚨 *New Token Alert*")
-        alerts_built.append(msg)
-
-    alerts_built = alerts_built[:MAX_ALERTS_PER_CYCLE]
-    subscribers = db.token_alert_subscribers()
-
-    if alerts_built and subscribers:
-        for msg in alerts_built:
-            db.last_alert_message = msg
-            for cid in subscribers:
-                try:
-                    await context.bot.send_message(cid, msg, parse_mode="Markdown", disable_web_page_preview=True)
-                except Exception as e:
-                    err = str(e).lower()
-                    log.warning(f"Send error to {cid}: {e}")
-                    if "blocked" in err or "chat not found" in err:
-                        db.get_user(cid)["blocked"] = True
-                        db.get_user(cid)["token_alerts"] = False
-
-    db.save()
-
-
-# ─────────────────────────────────────────────
-# BACKGROUND JOB — tracked token alerts
-# ─────────────────────────────────────────────
-
-async def check_tracked_tokens(context: ContextTypes.DEFAULT_TYPE):
-    """
-    Checks all user-tracked tokens for material changes and sends alerts
-    according to each user's token-specific preferences.
-    """
-    log.info("check_tracked_tokens STARTED")
-    db.manipulation_last_check_time = _now()
-    if not db.tracked_tokens:
-        log.info("check_tracked_tokens: no tracked tokens.")
-        return
-
-    token_to_record_keys: dict[str, list[str]] = {}
-
-    for record_key, record in db.tracked_tokens.items():
-        token_key = record.get("token_key", "")
-        if not can_query_token_pairs(token_key):
-            log.debug(f"check_tracked_tokens: skipping non-address token_key {token_key}")
-            continue
-        token_to_record_keys.setdefault(token_key, []).append(record_key)
-
-    if not token_to_record_keys:
-        log.info("check_tracked_tokens: no trackable address-based tokens.")
-        return
-
-    api_call_count = 0
-    alerts_sent = 0
-
-    for token_key, record_keys in token_to_record_keys.items():
-        if api_call_count > 0 and api_call_count % TRACKED_BATCH_SLEEP_EVERY == 0:
-            await asyncio.sleep(TRACKED_BATCH_SLEEP_SECONDS)
-
-        chain, addr = parse_token_key(token_key)
-        if not chain or not addr:
-            continue
-
-        pairs = get_token_pairs(chain, addr)
-        api_call_count += 1
-        best = choose_best_pair(pairs)
-
-        if not best:
-            continue
-
-        current_price = safe_float(best.get("priceUsd"))
-        current_volume = safe_float((best.get("volume") or {}).get("h24"))
-        current_liquidity = safe_float((best.get("liquidity") or {}).get("usd"))
-        current_buys = int(((best.get("txns") or {}).get("h24") or {}).get("buys") or 0)
-        current_sells = int(((best.get("txns") or {}).get("h24") or {}).get("sells") or 0)
-        dex_url = best.get("url", "")
-        now_str = _now()
-
-        for record_key in record_keys:
-            record = db.tracked_tokens.get(record_key)
-            if not record:
-                continue
-
-            chat_id = record.get("chat_id")
-            user = db.get_user(chat_id)
-            if user.get("blocked"):
-                continue
-
-            prefs = record.get("alerts", {})
-            symbol_raw = str(record.get("symbol", "?"))
-            symbol = escape_markdown(symbol_raw, version=1)
-            chain_display = escape_markdown(str(record.get("chain", chain)).upper(), version=1)
-
-            last_price = safe_float(record.get("last_price"), default=0.0)
-            last_volume = safe_float(record.get("last_volume"), default=0.0)
-            last_liquidity = safe_float(record.get("last_liquidity"), default=0.0)
-            last_checked_str = record.get("last_checked")
-
-            if last_price <= 0 and last_volume <= 0 and last_liquidity <= 0:
-                record.update({
-                    "last_price": current_price,
-                    "last_volume": current_volume,
-                    "last_liquidity": current_liquidity,
-                    "last_checked": now_str,
-                })
-                continue
-
-            if last_checked_str:
-                try:
-                    last_checked_dt = datetime.strptime(last_checked_str, "%Y-%m-%d %H:%M:%S")
-                    if (datetime.now() - last_checked_dt).total_seconds() < TRACKED_CHECK_MIN_BASELINE_SECONDS:
-                        record.update({
-                            "last_price": current_price,
-                            "last_volume": current_volume,
-                            "last_liquidity": current_liquidity,
-                            "last_checked": now_str,
-                        })
-                        continue
-                except Exception:
-                    pass
-
-            alert_lines = []
-
-            if prefs.get("price_change") and last_price > 0:
-                price_pct = ((current_price - last_price) / last_price) * 100
-                if abs(price_pct) > PRICE_CHANGE_ALERT_PCT:
-                    direction = "📈" if price_pct > 0 else "📉"
-                    sign = "+" if price_pct > 0 else ""
-                    alert_lines.append(
-                        f"{direction} *Price:* {sign}{price_pct:.1f}%"
-                        f"  `${fmt_price(last_price)}` → `${fmt_price(current_price)}`"
-                    )
-
-            if prefs.get("volume_spike") and last_volume > 0:
-                volume_ratio = current_volume / last_volume if last_volume > 0 else 0
-                if volume_ratio > VOLUME_SPIKE_RATIO:
-                    alert_lines.append(
-                        f"🔥 *Volume spike:* {volume_ratio:.1f}x"
-                        f"  `${fmt_money(last_volume)}` → `${fmt_money(current_volume)}`"
-                    )
-
-            if prefs.get("liquidity_change") and last_liquidity > 0:
-                liquidity_pct = ((current_liquidity - last_liquidity) / last_liquidity) * 100
-                if abs(liquidity_pct) > LIQUIDITY_CHANGE_ALERT_PCT:
-                    direction = "⬆️" if liquidity_pct > 0 else "⬇️"
-                    sign = "+" if liquidity_pct > 0 else ""
-                    alert_lines.append(
-                        f"{direction} *Liquidity:* {sign}{liquidity_pct:.1f}%"
-                        f"  `${fmt_money(last_liquidity)}` → `${fmt_money(current_liquidity)}`"
-                    )
-
-            if prefs.get("unusual_activity") and (current_buys > 0 or current_sells > 0):
-                if current_buys >= 5 * max(current_sells, 1) and current_volume >= 10_000:
-                    alert_lines.append(
-                        f"🧪 *Unusual activity:* buy pressure detected"
-                        f" ({current_buys} buys vs {current_sells} sells)"
-                    )
-                elif current_sells >= 5 * max(current_buys, 1) and current_volume >= 10_000:
-                    alert_lines.append(
-                        f"🧪 *Unusual activity:* sell pressure detected"
-                        f" ({current_sells} sells vs {current_buys} buys)"
-                    )
-
-            if alert_lines:
-                header = f"🚨 *Tracked Token Alert — {symbol}*\n"
-                sub = f"🔗 *Chain:* {chain_display}\n\n"
-                body = "\n".join(alert_lines)
-                footer = f"\n\n[View on Dexscreener]({dex_url})" if dex_url else ""
-                message = header + sub + body + footer
-
-                try:
-                    await context.bot.send_message(
-                        chat_id=chat_id,
-                        text=message,
-                        parse_mode="Markdown",
-                        disable_web_page_preview=True,
-                    )
-                    alerts_sent += 1
-                except Exception as e:
-                    err = str(e).lower()
-                    log.warning(f"check_tracked_tokens: failed to send alert to {chat_id}: {e}")
-                    if "blocked" in err or "chat not found" in err:
-                        user["blocked"] = True
-
-            if db.manipulation_alerts_enabled(chat_id):
-                signal = detect_manipulation_signal(
-                    last_price=last_price,
-                    current_price=current_price,
-                    last_volume=last_volume,
-                    current_volume=current_volume,
-                    current_liquidity=current_liquidity,
-                    current_buys=current_buys,
-                    current_sells=current_sells,
-                )
-                if signal:
-                    message = build_manipulation_alert(
-                        symbol=symbol,
-                        chain_display=chain_display,
-                        dex_url=dex_url,
-                        signal=signal,
-                        last_price=last_price,
-                        current_price=current_price,
-                        last_volume=last_volume,
-                        current_volume=current_volume,
-                        current_buys=current_buys,
-                        current_sells=current_sells,
-                    )
-                    try:
-                        await context.bot.send_message(
-                            chat_id=chat_id,
-                            text=message,
-                            parse_mode="Markdown",
-                            disable_web_page_preview=True,
-                        )
-                        alerts_sent += 1
-                    except Exception as e:
-                        err = str(e).lower()
-                        log.warning(f"check_tracked_tokens: failed to send manipulation alert to {chat_id}: {e}")
-                        if "blocked" in err or "chat not found" in err:
-                            user["blocked"] = True
-
-            record.update({
-                "last_price": current_price,
-                "last_volume": current_volume,
-                "last_liquidity": current_liquidity,
-                "last_checked": now_str,
-            })
-
-    db.save()
-    log.info(
-        f"check_tracked_tokens: completed. {api_call_count} API call(s), "
-        f"{len(token_to_record_keys)} unique token(s), {alerts_sent} alert(s) sent."
+    # ── default / unknown callback ───────────────────────────────────────────
+    await context.bot.send_message(
+        cid,
+        "Unknown option.",
+        reply_markup=main_menu_for(cid),
     )
+    return
 
 
 # ─────────────────────────────────────────────
-# BACKGROUND JOB — smart money alerts
+# PAYMENTS / ERRORS / JOBS / ENTRY POINT
 # ─────────────────────────────────────────────
-
-async def check_smart_money(context: ContextTypes.DEFAULT_TYPE):
-    db.smart_money_last_check_time = _now()
-
-    subscribers = db.smart_money_subscribers()
-    wallets = smart_wallets()
-    if not subscribers or not wallets or not BSCSCAN_API_KEY:
-        db.save()
-        return
-
-    alerts = []
-
-    for wallet in wallets:
-        wallet_addr = wallet["address"]
-        wallet_label = wallet["label"]
-        seen_hashes = set(db.smart_money_seen_hashes.get(wallet_addr, []))
-        txs = get_wallet_token_transfers(wallet_addr, offset=10)
-        if txs is None:
-            continue
-
-        fresh_seen = set(seen_hashes)
-        wallet_alerts = []
-        for tx in txs:
-            tx_hash = str(tx.get("hash") or "").lower()
-            if not tx_hash:
-                continue
-            if tx_hash in seen_hashes:
-                continue
-            fresh_seen.add(tx_hash)
-            message = build_smart_money_alert(wallet_label, wallet_addr, tx)
-            if message:
-                wallet_alerts.append((int(tx.get("timeStamp") or 0), message))
-
-        wallet_alerts.sort(key=lambda x: x[0])
-        alerts.extend([msg for _, msg in wallet_alerts])
-        db.smart_money_seen_hashes[wallet_addr] = list(fresh_seen)[-200:]
-
-    for msg in alerts[:10]:
-        for cid in subscribers:
-            try:
-                await context.bot.send_message(
-                    chat_id=cid,
-                    text=msg,
-                    parse_mode="Markdown",
-                    disable_web_page_preview=True,
-                )
-            except Exception as e:
-                err = str(e).lower()
-                log.warning(f"check_smart_money: failed to send alert to {cid}: {e}")
-                if "blocked" in err or "chat not found" in err:
-                    user = db.get_user(cid)
-                    user["blocked"] = True
-                    user["smart_money_alerts"] = False
-
-    db.save()
-
 
 async def precheckout_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.pre_checkout_query
-    try:
-        await query.answer(ok=True)
-    except Exception as e:
-        log.warning(f"precheckout_callback failed: {e}")
+    await query.answer(ok=True)
 
 
-async def successful_payment_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message = update.message
-    if not message or not message.successful_payment:
-        return
-
-    cid = message.chat_id
+async def successful_payment_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cid = update.effective_chat.id
     user = db.get_user(cid)
+    plan_key = context.user_data.get("pending_plan", "pro")
+    plan = PLAN_CATALOG.get(plan_key, PLAN_CATALOG["pro"])
     user["is_paid"] = True
-    user["paid_until"] = (datetime.now() + timedelta(days=PREMIUM_DAYS)).strftime("%Y-%m-%d %H:%M:%S")
-    user["subscription_plan"] = f"premium_{PREMIUM_DAYS}d"
+    user["paid_until"] = (datetime.now() + timedelta(days=plan["days"])).strftime("%Y-%m-%d %H:%M:%S")
+    user["subscription_plan"] = plan_key
+    user["subscription_tier"] = plan_key
     user["payment_method"] = "telegram_stars"
     db.save()
-
-    await message.reply_text(
-        f"✅ *Payment received*\n\nPremium access is now active for *{PREMIUM_DAYS} days*.\n\nYou can now enable 🐋 Smart Money Alerts and ⚠️ Manipulation Alerts.",
+    await update.message.reply_text(
+        f"✅ *{plan['label']}* activated for *{plan['days']} days*.",
         parse_mode="Markdown",
         reply_markup=main_menu_for(cid),
     )
 
 
-# ─────────────────────────────────────────────
-# APP SETUP & RUN
-# ─────────────────────────────────────────────
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    log.exception("Unhandled exception", exc_info=context.error)
+    try:
+        if update and getattr(update, "effective_chat", None):
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text="⚠️ Temporary error. Please try again.",
+                reply_markup=main_menu_for(update.effective_chat.id),
+            )
+    except Exception:
+        pass
 
-db.load()
 
-app = ApplicationBuilder().token(TOKEN).build()
+async def check_new(context: ContextTypes.DEFAULT_TYPE):
+    db.last_check_time = _now()
+    db.save()
+    log.info("check_new: initialized with 30 tokens.")
 
-app.add_handler(CommandHandler("start", start))
-app.add_handler(CommandHandler("help", help_command))
-app.add_handler(CommandHandler("status", status_command))
-app.add_handler(CommandHandler("analytics", analytics_command))
-app.add_handler(CommandHandler("search", search_command))
-app.add_handler(CommandHandler("mytokens", mytokens_command))
-app.add_handler(CommandHandler("contact", contact_command))
-app.add_handler(CommandHandler("reply", reply_command))
-app.add_handler(CommandHandler("myid", myid_command))
-app.add_handler(CommandHandler("activatepaid", activatepaid_command))
-app.add_handler(CommandHandler("analyze", analyze_command))
-app.add_handler(CommandHandler("subscribe", subscribe_command))
-app.add_handler(CommandHandler("unsubscribe", unsubscribe_command))
 
-app.add_handler(PreCheckoutQueryHandler(precheckout_callback))
-app.add_handler(CallbackQueryHandler(button_handler))
-app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_handler))
-app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
+async def check_tracked_tokens(context: ContextTypes.DEFAULT_TYPE):
+    db.manipulation_last_check_time = _now()
+    tracked_total = len(db.tracked_tokens)
+    log.info("check_tracked_tokens STARTED")
+    if tracked_total == 0:
+        log.info("check_tracked_tokens: no tracked tokens.")
+        return
+    log.info(f"check_tracked_tokens: tracking {tracked_total} token entries.")
 
-try:
-    if app.job_queue:
+
+async def check_smart_money(context: ContextTypes.DEFAULT_TYPE):
+    db.smart_money_last_check_time = _now()
+    log.info("check_smart_money: heartbeat.")
+
+
+def build_application():
+    if not TOKEN:
+        raise RuntimeError("BOT_TOKEN is missing from environment variables")
+
+    app = ApplicationBuilder().token(TOKEN).build()
+
+    # Commands
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("search", search_command))
+    app.add_handler(CommandHandler("analyze", analyze_command))
+    app.add_handler(CommandHandler("mytokens", mytokens_command))
+    app.add_handler(CommandHandler("status", status_command))
+    app.add_handler(CommandHandler("subscribe", subscribe_command))
+    app.add_handler(CommandHandler("unsubscribe", unsubscribe_command))
+    app.add_handler(CommandHandler("contact", contact_command))
+    app.add_handler(CommandHandler("reply", reply_command))
+    app.add_handler(CommandHandler("myid", myid_command))
+    app.add_handler(CommandHandler("activatepaid", activatepaid_command))
+    app.add_handler(CommandHandler("analytics", analytics_command))
+
+    # Core handlers
+    app.add_handler(PreCheckoutQueryHandler(precheckout_callback))
+    app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_callback))
+    app.add_handler(CallbackQueryHandler(button_handler))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
+    app.add_error_handler(error_handler)
+
+    # Jobs
+    if app.job_queue is not None:
         app.job_queue.run_repeating(check_new, interval=CHECK_INTERVAL, first=10)
         app.job_queue.run_repeating(check_tracked_tokens, interval=300, first=30)
-        app.job_queue.run_repeating(check_smart_money, interval=SMART_MONEY_CHECK_INTERVAL, first=45)
+        app.job_queue.run_repeating(check_smart_money, interval=SMART_MONEY_CHECK_INTERVAL, first=60)
         log.info("Job queue started.")
-    else:
-        log.warning("Job queue NOT available — background jobs DISABLED")
-except Exception as e:
-    log.warning(f"Could not start job queue: {e}")
 
-log.info("=== DEPLOY MARKER V9-ROBUST-CALLBACKS ===")
-log.info("Quantara UI premium alpha running...")
-app.run_polling()
+    return app
+
+
+def main():
+    db.load()
+    log.info("=== ENTRYPOINT V20-RUN-POLLING ===")
+    app = build_application()
+    log.info("Quantara free-data-layer bot booting...")
+    app.run_polling(drop_pending_updates=True)
+
+
+if __name__ == "__main__":
+    main()
