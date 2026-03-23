@@ -31,7 +31,7 @@ FIXES in this version (V10 — callback resolution):
   are visible in production logs.
 """
 
-print("=== DEPLOY MARKER V12-PENDING-TRACK ===")
+print("=== DEPLOY MARKER V13-DEDICATED-TRACK-HANDLERS ===")
 
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, LabeledPrice
@@ -2639,6 +2639,139 @@ async def check_smart_money(context: ContextTypes.DEFAULT_TYPE):
     db.save()
 
 
+
+
+async def handle_track_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+
+    cid = query.message.chat_id
+    data = query.data
+    user = db.get_user(cid)
+    pending = context.user_data.get("pending_track") or user.get("pending_track") or {}
+
+    token_key = pending.get("token_key")
+    symbol = pending.get("symbol", "Token")
+    name = pending.get("name", symbol)
+    chain = pending.get("chain", "bsc")
+
+    if not token_key:
+        await context.bot.send_message(
+            cid,
+            "⚠️ Could not identify the token. Please search again.",
+            reply_markup=main_menu_for(cid),
+        )
+        return
+
+    if data == "track_add_pending":
+        existing = db.get_tracked_token(cid, token_key)
+        if not existing:
+            current_limit = tracked_token_limit_for(cid)
+            if len(db.get_tracked(cid)) >= current_limit:
+                await context.bot.send_message(
+                    cid,
+                    f"⛔ Tracking limit reached. Your current tier allows *{current_limit}* tracked tokens.",
+                    parse_mode="Markdown",
+                    reply_markup=premium_gate_menu(),
+                )
+                return
+            db.track_token(cid, token_key, symbol, name, chain)
+            text = f"✅ *{escape_markdown(symbol, version=1)}* تمت إضافتها إلى *My Tokens*."
+        else:
+            text = f"✅ *{escape_markdown(existing.get('symbol', symbol), version=1)}* موجودة بالفعل داخل *My Tokens*."
+
+        context.user_data.pop("pending_track", None)
+        user.pop("pending_track", None)
+        db.save()
+
+        await context.bot.send_message(
+            cid,
+            text,
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📋 My Tokens", callback_data="my_tokens")],
+                [InlineKeyboardButton("⬅️ Main Menu", callback_data="back_main")],
+            ]),
+        )
+        return
+
+    if data == "track_skip_pending":
+        removed_text = "👍 لم تتم إضافة العملة إلى *My Tokens*."
+        existing = db.get_tracked_token(cid, token_key)
+        if existing:
+            db.untrack_token(cid, token_key)
+            removed_text = f"🗑️ تم حذف *{escape_markdown(existing.get('symbol', symbol), version=1)}* من *My Tokens*."
+
+        context.user_data.pop("pending_track", None)
+        user.pop("pending_track", None)
+        db.save()
+
+        await context.bot.send_message(
+            cid,
+            removed_text,
+            parse_mode="Markdown",
+            reply_markup=main_menu_for(cid),
+        )
+        return
+
+
+async def handle_manage_alerts_direct(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+
+    cid = query.message.chat_id
+    token_ref = query.data.split(":", 1)[1]
+    token_key = resolve_token_ref_robust(cid, token_ref, context)
+    entry = db.get_tracked_token(cid, token_key)
+
+    if not entry:
+        tracked_now = db.get_tracked(cid)
+        if len(tracked_now) == 1:
+            token_key = tracked_now[0].get("token_key")
+            entry = db.get_tracked_token(cid, token_key)
+
+    if not entry:
+        await context.bot.send_message(
+            cid,
+            "⚠️ Token not found in your tracked list.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📋 My Tokens", callback_data="my_tokens")],
+                [InlineKeyboardButton("⬅️ Main Menu", callback_data="back_main")],
+            ]),
+        )
+        return
+
+    delivered = await _send_alert_settings(context, cid, token_key)
+    if not delivered:
+        await context.bot.send_message(
+            cid,
+            "⚠️ Could not open alert settings right now. Please try again.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📋 My Tokens", callback_data="my_tokens")],
+                [InlineKeyboardButton("⬅️ Main Menu", callback_data="back_main")],
+            ]),
+        )
+        return
+
+    try:
+        await query.edit_message_text(
+            "⚙️ Alert settings opened below.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📋 My Tokens", callback_data="my_tokens")],
+                [InlineKeyboardButton("⬅️ Main Menu", callback_data="back_main")],
+            ]),
+        )
+    except Exception:
+        pass
+
+
+
 async def precheckout_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.pre_checkout_query
     try:
@@ -2690,6 +2823,8 @@ app.add_handler(CommandHandler("subscribe", subscribe_command))
 app.add_handler(CommandHandler("unsubscribe", unsubscribe_command))
 
 app.add_handler(PreCheckoutQueryHandler(precheckout_callback))
+app.add_handler(CallbackQueryHandler(handle_track_pending, pattern="^(track_add_pending|track_skip_pending)$"))
+app.add_handler(CallbackQueryHandler(handle_manage_alerts_direct, pattern=r"^manage_alerts:"))
 app.add_handler(CallbackQueryHandler(button_handler))
 app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_handler))
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
@@ -2705,6 +2840,6 @@ try:
 except Exception as e:
     log.warning(f"Could not start job queue: {e}")
 
-log.info("=== DEPLOY MARKER V10-CALLBACK-RESOLUTION-FIX ===")
+log.info("=== DEPLOY MARKER V13-DEDICATED-TRACK-HANDLERS ===")
 log.info("Quantara UI premium alpha running...")
 app.run_polling()
