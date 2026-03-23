@@ -31,7 +31,7 @@ FIXES in this version (V10 — callback resolution):
   are visible in production logs.
 """
 
-print("=== DEPLOY MARKER V19-FREE-DATA-LAYER ===")
+print("=== DEPLOY MARKER V17-NO-MANAGE-ALERTS ===")
 
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, LabeledPrice
@@ -85,9 +85,7 @@ MIN_VOLUME = 5000
 CHECK_INTERVAL = 180
 MAX_ALERTS_PER_CYCLE = 1
 DATA_FILE = "bot_data.json"
-BSCSCAN_API_KEY = os.getenv("BSCSCAN_API_KEY", "")  # optional, not required for the free data layer
-BNB_RPC_URL = os.getenv("BNB_RPC_URL", "https://bsc-dataseed.bnbchain.org")
-GECKO_TERMINAL_BASE = os.getenv("GECKO_TERMINAL_BASE", "https://api.geckoterminal.com/api/v2")
+BSCSCAN_API_KEY = os.getenv("BSCSCAN_API_KEY", "")
 SMART_MONEY_CHECK_INTERVAL = 180
 SMART_MONEY_MIN_TOKEN_VALUE_USD = 1000.0
 SMART_MONEY_WALLETS = [
@@ -717,82 +715,18 @@ def get_latest_profiles() -> list:
     return []
 
 
-def gecko_get(path: str, params: dict = None, timeout: int = 15):
-    try:
-        r = requests.get(f"{GECKO_TERMINAL_BASE}{path}", params=params, timeout=timeout, headers={"Accept": "application/json"})
-        r.raise_for_status()
-        return r.json()
-    except Exception as e:
-        log.warning(f"GeckoTerminal request failed for {path}: {e}")
-    return None
-
-
-def _to_dex_pair_from_gecko_pool(pool: dict) -> dict:
-    attrs = pool.get("attributes") or {}
-    relationships = pool.get("relationships") or {}
-    base_data = ((relationships.get("base_token") or {}).get("data") or {})
-    chain = str(attrs.get("network") or CHAIN_FILTER).lower()
-    price_usd = attrs.get("base_token_price_usd") or attrs.get("price_in_usd") or "0"
-    return {
-        "chainId": chain,
-        "dexId": attrs.get("dex_name") or "geckoterminal",
-        "url": attrs.get("reserve_in_usd") and f"https://www.geckoterminal.com/{chain}/pools/{pool.get('id','').split('_')[-1]}",
-        "priceUsd": price_usd,
-        "priceChange": {"h24": attrs.get("price_change_percentage", {}).get("h24") if isinstance(attrs.get("price_change_percentage"), dict) else attrs.get("price_percent_change_24h") or 0},
-        "liquidity": {"usd": attrs.get("reserve_in_usd") or 0},
-        "volume": {"h24": attrs.get("volume_usd", {}).get("h24") if isinstance(attrs.get("volume_usd"), dict) else attrs.get("volume_usd_24h") or 0},
-        "txns": {"h24": {"buys": (attrs.get("transactions") or {}).get("h24", {}).get("buys", 0) if isinstance(attrs.get("transactions"), dict) else 0,
-                          "sells": (attrs.get("transactions") or {}).get("h24", {}).get("sells", 0) if isinstance(attrs.get("transactions"), dict) else 0}},
-        "baseToken": {
-            "address": base_data.get("id", "").split('_')[-1] if base_data.get("id") else "",
-            "symbol": attrs.get("name", "?").split("/")[0].strip() if attrs.get("name") else "?",
-            "name": attrs.get("name", "?"),
-        },
-    }
-
-
-def gecko_search_pairs(q: str) -> list:
-    data = gecko_get("/search/pools", params={"query": q})
-    if not data or not isinstance(data, dict):
-        return []
-    pools = data.get("data") or []
-    out = []
-    for pool in pools[:10]:
-        try:
-            out.append(_to_dex_pair_from_gecko_pool(pool))
-        except Exception as e:
-            log.warning(f"Failed to normalize GeckoTerminal pool: {e}")
-    return out
-
-
-def gecko_get_token_pools(chain: str, addr: str) -> list:
-    data = gecko_get(f"/networks/{chain}/tokens/{addr}/pools")
-    if not data or not isinstance(data, dict):
-        return []
-    pools = data.get("data") or []
-    out = []
-    for pool in pools[:10]:
-        try:
-            out.append(_to_dex_pair_from_gecko_pool(pool))
-        except Exception as e:
-            log.warning(f"Failed to normalize GeckoTerminal token pool: {e}")
-    return out
-
-
 def search_pairs(q: str) -> list:
     data = dex_get("https://api.dexscreener.com/latest/dex/search", params={"q": q})
     if data and isinstance(data, dict):
-        pairs = data.get("pairs", []) or []
-        if pairs:
-            return pairs
-    return gecko_search_pairs(q)
+        return data.get("pairs", []) or []
+    return []
 
 
 def get_token_pairs(chain: str, addr: str) -> list:
     data = dex_get(f"https://api.dexscreener.com/token-pairs/v1/{chain}/{addr}")
-    if data and isinstance(data, list) and data:
+    if data and isinstance(data, list):
         return data
-    return gecko_get_token_pools(chain, addr)
+    return []
 
 
 # ─────────────────────────────────────────────
@@ -1024,9 +958,16 @@ def main_menu_for(chat_id: int) -> InlineKeyboardMarkup:
 
 
 def track_prompt_menu(chat_id: int, token_key: str) -> InlineKeyboardMarkup:
-    # Legacy helper kept for compatibility; auto-tracking is now used after search.
+    # Use short fixed callback_data for the initial search-result prompt.
+    # The actual token is resolved from persisted pending_track, which is more
+    # reliable than shipping token refs here.
     remember_token_ref(chat_id, token_key)
-    return InlineKeyboardMarkup([])
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ Track this token", callback_data="track_add_pending"),
+            InlineKeyboardButton("❌ No thanks", callback_data="track_skip_pending"),
+        ]
+    ])
 
 
 def tracked_token_action_menu(chat_id: int, token_key: str) -> InlineKeyboardMarkup:
@@ -1112,7 +1053,6 @@ def smart_wallets() -> list:
 
 
 def bscscan_get(params: dict, timeout: int = 20):
-    # Optional explorer path. The free data layer does not require this key.
     if not BSCSCAN_API_KEY:
         return None
     full_params = dict(params)
@@ -1237,14 +1177,11 @@ def build_smart_money_alert(wallet_label: str, wallet_address: str, tx: dict, cl
 
 
 async def smart_money_check(token_key: str) -> dict:
-    # Free-data-layer compatible status report. Smart money can work later with
-    # optional explorer or RPC enrichment, but the core product no longer
-    # depends on a paid explorer API to search, score, or track tokens.
+    # kept for compatibility with older code paths
     return {
-        "status": "optional_explorer" if BSCSCAN_API_KEY else "free_data_layer",
+        "status": "bscscan_ready" if BSCSCAN_API_KEY else "disabled",
         "tracked_wallets": len(smart_wallets()),
-        "confidence": 60 if BSCSCAN_API_KEY else 35,
-        "market_data": "DexScreener + GeckoTerminal",
+        "confidence": 60 if BSCSCAN_API_KEY else 0,
     }
 
 
@@ -1681,60 +1618,37 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     name = (best.get("baseToken") or {}).get("name", "???")
     chain = (best.get("chainId") or "unknown").lower()
 
-    # Persist the latest token reference for compatibility with older callback paths,
-    # even though the bot now auto-adds newly scanned tokens.
-    latest_track_data = {
+    pending_track_data = {
         "token_key": token_key,
         "symbol": symbol,
         "name": name,
         "chain": chain,
     }
-    context.user_data["pending_track"] = latest_track_data
-    db.get_user(cid)["pending_track"] = latest_track_data
+    context.user_data["pending_track"] = pending_track_data
+    # FIX: persist pending_track to user record so it survives bot restarts.
+    # This ensures track_add / track_skip buttons still work after a redeploy.
+    db.get_user(cid)["pending_track"] = pending_track_data
 
-    existing = db.get_tracked_token(cid, token_key)
-    if not existing:
-        current_limit = tracked_token_limit_for(cid)
-        if len(db.get_tracked(cid)) >= current_limit:
-            await update.message.reply_text(
-                f"⛔ Tracking limit reached. Your current tier allows *{current_limit}* tracked tokens.\n\n"
-                "Upgrade to increase your watchlist capacity.",
-                parse_mode="Markdown",
-                reply_markup=premium_gate_menu(),
-            )
-            db.save()
-            return
+    already_tracked = db.get_tracked_token(cid, token_key) is not None
 
-        db.track_token(cid, token_key, symbol, name, chain)
-        db.save()
-
+    if not already_tracked:
         await update.message.reply_text(
-            f"✅ *{escape_markdown(symbol, version=1)}* was added to *My Tokens*.\n\n"
-            "To remove it later:\n"
-            "1. Open *My Tokens*\n"
-            "2. Tap the token\n"
-            "3. Confirm deletion\n\n"
-            "This keeps your watchlist clean while you track active setups.",
+            f"📌 Do you want to add *{escape_markdown(symbol, version=1)}* to your tracked list?",
             parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("📋 My Tokens", callback_data="my_tokens")],
-                [InlineKeyboardButton("⬅️ Main Menu", callback_data="back_main")],
-            ]),
+            reply_markup=track_prompt_menu(cid, token_key),
         )
+        # FIX: save AFTER track_prompt_menu is built so callback_token_map entry
+        # created inside remember_token_ref() is persisted before the user taps.
+        db.save()
     else:
         await update.message.reply_text(
-            f"✅ *{escape_markdown(symbol, version=1)}* is already in *My Tokens*.\n\n"
-            "If you want to remove it later:\n"
-            "1. Open *My Tokens*\n"
-            "2. Tap the token\n"
-            "3. Confirm deletion",
+            f"✅ You're already tracking *{escape_markdown(symbol, version=1)}*.\n\nManage alerts from *My Tracked Tokens*.",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("📋 My Tokens", callback_data="my_tokens")],
+                [InlineKeyboardButton("📋 My Tracked Tokens", callback_data="my_tokens")],
                 [InlineKeyboardButton("⬅️ Main Menu", callback_data="back_main")],
             ]),
         )
-
 
 
 # ─────────────────────────────────────────────
@@ -2056,8 +1970,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         chain_safe = escape_markdown(str(entry.get("chain", "?")).upper(), version=1)
         text = (
             f"📌 *{symbol_safe}* — {chain_safe}\n\n"
-            "This token is currently in *My Tokens*.\n\n"
-            "Do you want to remove it from your watchlist?"
+            "Do you want to delete this token from your tracked list?\n\n"
+            ""
         )
 
         try:
@@ -2072,9 +1986,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         entry = db.get_tracked_token(cid, token_key)
         symbol_safe = escape_markdown(str((entry or {}).get("symbol", token_key)), version=1)
         text = (
-            f"🗑 *Remove {symbol_safe}?*\n\n"
-            "Press *Yes* to delete it from *My Tokens*.\n"
-            "Press *No* to go back to the main menu."
+            f"🗑 *Delete {symbol_safe}?*\n\n"
+            "Press *Yes* to remove it from your tracked list.\n"
+            "Press *No* to return to the main menu."
         )
         try:
             await safe_edit_message_text(query, context, text, parse_mode="Markdown", reply_markup=token_delete_confirm_menu(cid, token_key))
@@ -2116,10 +2030,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
             db.track_token(cid, token_key, symbol, name, chain)
             db.save()
-            text = f"✅ *{escape_markdown(symbol, version=1)}* was added to *My Tokens*."
+            text = f"✅ *{escape_markdown(symbol, version=1)}* تمت إضافتها إلى *My Tokens*."
         else:
             symbol = existing.get("symbol", symbol)
-            text = f"✅ *{escape_markdown(symbol, version=1)}* is already in *My Tokens*."
+            text = f"✅ *{escape_markdown(symbol, version=1)}* موجودة بالفعل داخل *My Tokens*."
 
         context.user_data.pop("pending_track", None)
         db.get_user(cid).pop("pending_track", None)
@@ -2149,11 +2063,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if existing:
                 symbol = existing.get("symbol", symbol)
 
-        msg = "👍 The token was not added to *My Tokens*."
+        msg = "👍 لم تتم إضافة العملة إلى *My Tokens*."
         if token_key and db.get_tracked_token(cid, token_key):
             db.untrack_token(cid, token_key)
             db.save()
-            msg = f"🗑️ *{escape_markdown(symbol, version=1)}* was removed from *My Tokens*."
+            msg = f"🗑️ تم حذف *{escape_markdown(symbol, version=1)}* من *My Tokens*."
 
         context.user_data.pop("pending_track", None)
         db.get_user(cid).pop("pending_track", None)
@@ -2194,122 +2108,3 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # (already done above), use send_message() as the primary UI response,
     # and wrap the optional edit attempt in its own isolated try block.
     
-
-    # ── default / unknown callback ───────────────────────────────────────────
-    await context.bot.send_message(
-        cid,
-        "Unknown option.",
-        reply_markup=main_menu_for(cid),
-    )
-    return
-
-
-# ─────────────────────────────────────────────
-# PAYMENTS / ERRORS / JOBS / ENTRY POINT
-# ─────────────────────────────────────────────
-
-async def precheckout_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.pre_checkout_query
-    await query.answer(ok=True)
-
-
-async def successful_payment_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    cid = update.effective_chat.id
-    user = db.get_user(cid)
-    plan_key = context.user_data.get("pending_plan", "pro")
-    plan = PLAN_CATALOG.get(plan_key, PLAN_CATALOG["pro"])
-    user["is_paid"] = True
-    user["paid_until"] = (datetime.now() + timedelta(days=plan["days"])).strftime("%Y-%m-%d %H:%M:%S")
-    user["subscription_plan"] = plan_key
-    user["subscription_tier"] = plan_key
-    user["payment_method"] = "telegram_stars"
-    db.save()
-    await update.message.reply_text(
-        f"✅ *{plan['label']}* activated for *{plan['days']} days*.",
-        parse_mode="Markdown",
-        reply_markup=main_menu_for(cid),
-    )
-
-
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    log.exception("Unhandled exception", exc_info=context.error)
-    try:
-        if update and getattr(update, "effective_chat", None):
-            await context.bot.send_message(
-                chat_id=update.effective_chat.id,
-                text="⚠️ Temporary error. Please try again.",
-                reply_markup=main_menu_for(update.effective_chat.id),
-            )
-    except Exception:
-        pass
-
-
-async def check_new(context: ContextTypes.DEFAULT_TYPE):
-    db.last_check_time = _now()
-    db.save()
-    log.info("check_new: initialized with 30 tokens.")
-
-
-async def check_tracked_tokens(context: ContextTypes.DEFAULT_TYPE):
-    db.manipulation_last_check_time = _now()
-    tracked_total = len(db.tracked_tokens)
-    log.info("check_tracked_tokens STARTED")
-    if tracked_total == 0:
-        log.info("check_tracked_tokens: no tracked tokens.")
-        return
-    log.info(f"check_tracked_tokens: tracking {tracked_total} token entries.")
-
-
-async def check_smart_money(context: ContextTypes.DEFAULT_TYPE):
-    db.smart_money_last_check_time = _now()
-    log.info("check_smart_money: heartbeat.")
-
-
-def build_application():
-    if not TOKEN:
-        raise RuntimeError("BOT_TOKEN is missing from environment variables")
-
-    app = ApplicationBuilder().token(TOKEN).build()
-
-    # Commands
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(CommandHandler("search", search_command))
-    app.add_handler(CommandHandler("analyze", analyze_command))
-    app.add_handler(CommandHandler("mytokens", mytokens_command))
-    app.add_handler(CommandHandler("status", status_command))
-    app.add_handler(CommandHandler("subscribe", subscribe_command))
-    app.add_handler(CommandHandler("unsubscribe", unsubscribe_command))
-    app.add_handler(CommandHandler("contact", contact_command))
-    app.add_handler(CommandHandler("reply", reply_command))
-    app.add_handler(CommandHandler("myid", myid_command))
-    app.add_handler(CommandHandler("activatepaid", activatepaid_command))
-    app.add_handler(CommandHandler("analytics", analytics_command))
-
-    # Core handlers
-    app.add_handler(PreCheckoutQueryHandler(precheckout_callback))
-    app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_callback))
-    app.add_handler(CallbackQueryHandler(button_handler))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
-    app.add_error_handler(error_handler)
-
-    # Jobs
-    if app.job_queue is not None:
-        app.job_queue.run_repeating(check_new, interval=CHECK_INTERVAL, first=10)
-        app.job_queue.run_repeating(check_tracked_tokens, interval=300, first=30)
-        app.job_queue.run_repeating(check_smart_money, interval=SMART_MONEY_CHECK_INTERVAL, first=60)
-        log.info("Job queue started.")
-
-    return app
-
-
-def main():
-    db.load()
-    log.info("=== ENTRYPOINT V20-RUN-POLLING ===")
-    app = build_application()
-    log.info("Quantara free-data-layer bot booting...")
-    app.run_polling(drop_pending_updates=True)
-
-
-if __name__ == "__main__":
-    main()
