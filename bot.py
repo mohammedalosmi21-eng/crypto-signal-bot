@@ -31,7 +31,7 @@ FIXES in this version (V10 — callback resolution):
   are visible in production logs.
 """
 
-print("=== DEPLOY MARKER V17-NO-MANAGE-ALERTS ===")
+print("=== DEPLOY MARKER V18-AUTO-TRACK-NO-PROMPT ===")
 
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, LabeledPrice
@@ -958,16 +958,9 @@ def main_menu_for(chat_id: int) -> InlineKeyboardMarkup:
 
 
 def track_prompt_menu(chat_id: int, token_key: str) -> InlineKeyboardMarkup:
-    # Use short fixed callback_data for the initial search-result prompt.
-    # The actual token is resolved from persisted pending_track, which is more
-    # reliable than shipping token refs here.
+    # Legacy helper kept for compatibility; auto-tracking is now used after search.
     remember_token_ref(chat_id, token_key)
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("✅ Track this token", callback_data="track_add_pending"),
-            InlineKeyboardButton("❌ No thanks", callback_data="track_skip_pending"),
-        ]
-    ])
+    return InlineKeyboardMarkup([])
 
 
 def tracked_token_action_menu(chat_id: int, token_key: str) -> InlineKeyboardMarkup:
@@ -1618,37 +1611,60 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     name = (best.get("baseToken") or {}).get("name", "???")
     chain = (best.get("chainId") or "unknown").lower()
 
-    pending_track_data = {
+    # Persist the latest token reference for compatibility with older callback paths,
+    # even though the bot now auto-adds newly scanned tokens.
+    latest_track_data = {
         "token_key": token_key,
         "symbol": symbol,
         "name": name,
         "chain": chain,
     }
-    context.user_data["pending_track"] = pending_track_data
-    # FIX: persist pending_track to user record so it survives bot restarts.
-    # This ensures track_add / track_skip buttons still work after a redeploy.
-    db.get_user(cid)["pending_track"] = pending_track_data
+    context.user_data["pending_track"] = latest_track_data
+    db.get_user(cid)["pending_track"] = latest_track_data
 
-    already_tracked = db.get_tracked_token(cid, token_key) is not None
+    existing = db.get_tracked_token(cid, token_key)
+    if not existing:
+        current_limit = tracked_token_limit_for(cid)
+        if len(db.get_tracked(cid)) >= current_limit:
+            await update.message.reply_text(
+                f"⛔ Tracking limit reached. Your current tier allows *{current_limit}* tracked tokens.\n\n"
+                "Upgrade to increase your watchlist capacity.",
+                parse_mode="Markdown",
+                reply_markup=premium_gate_menu(),
+            )
+            db.save()
+            return
 
-    if not already_tracked:
-        await update.message.reply_text(
-            f"📌 Do you want to add *{escape_markdown(symbol, version=1)}* to your tracked list?",
-            parse_mode="Markdown",
-            reply_markup=track_prompt_menu(cid, token_key),
-        )
-        # FIX: save AFTER track_prompt_menu is built so callback_token_map entry
-        # created inside remember_token_ref() is persisted before the user taps.
+        db.track_token(cid, token_key, symbol, name, chain)
         db.save()
-    else:
+
         await update.message.reply_text(
-            f"✅ You're already tracking *{escape_markdown(symbol, version=1)}*.\n\nManage alerts from *My Tracked Tokens*.",
+            f"✅ *{escape_markdown(symbol, version=1)}* was added to *My Tokens*.\n\n"
+            "To remove it later:\n"
+            "1. Open *My Tokens*\n"
+            "2. Tap the token\n"
+            "3. Confirm deletion\n\n"
+            "This keeps your watchlist clean while you track active setups.",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("📋 My Tracked Tokens", callback_data="my_tokens")],
+                [InlineKeyboardButton("📋 My Tokens", callback_data="my_tokens")],
                 [InlineKeyboardButton("⬅️ Main Menu", callback_data="back_main")],
             ]),
         )
+    else:
+        await update.message.reply_text(
+            f"✅ *{escape_markdown(symbol, version=1)}* is already in *My Tokens*.\n\n"
+            "If you want to remove it later:\n"
+            "1. Open *My Tokens*\n"
+            "2. Tap the token\n"
+            "3. Confirm deletion",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📋 My Tokens", callback_data="my_tokens")],
+                [InlineKeyboardButton("⬅️ Main Menu", callback_data="back_main")],
+            ]),
+        )
+
 
 
 # ─────────────────────────────────────────────
@@ -1970,8 +1986,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         chain_safe = escape_markdown(str(entry.get("chain", "?")).upper(), version=1)
         text = (
             f"📌 *{symbol_safe}* — {chain_safe}\n\n"
-            "Do you want to delete this token from your tracked list?\n\n"
-            ""
+            "This token is currently in *My Tokens*.\n\n"
+            "Do you want to remove it from your watchlist?"
         )
 
         try:
@@ -1986,9 +2002,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         entry = db.get_tracked_token(cid, token_key)
         symbol_safe = escape_markdown(str((entry or {}).get("symbol", token_key)), version=1)
         text = (
-            f"🗑 *Delete {symbol_safe}?*\n\n"
-            "Press *Yes* to remove it from your tracked list.\n"
-            "Press *No* to return to the main menu."
+            f"🗑 *Remove {symbol_safe}?*\n\n"
+            "Press *Yes* to delete it from *My Tokens*.\n"
+            "Press *No* to go back to the main menu."
         )
         try:
             await safe_edit_message_text(query, context, text, parse_mode="Markdown", reply_markup=token_delete_confirm_menu(cid, token_key))
@@ -2030,10 +2046,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
             db.track_token(cid, token_key, symbol, name, chain)
             db.save()
-            text = f"✅ *{escape_markdown(symbol, version=1)}* تمت إضافتها إلى *My Tokens*."
+            text = f"✅ *{escape_markdown(symbol, version=1)}* was added to *My Tokens*."
         else:
             symbol = existing.get("symbol", symbol)
-            text = f"✅ *{escape_markdown(symbol, version=1)}* موجودة بالفعل داخل *My Tokens*."
+            text = f"✅ *{escape_markdown(symbol, version=1)}* is already in *My Tokens*."
 
         context.user_data.pop("pending_track", None)
         db.get_user(cid).pop("pending_track", None)
@@ -2063,11 +2079,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if existing:
                 symbol = existing.get("symbol", symbol)
 
-        msg = "👍 لم تتم إضافة العملة إلى *My Tokens*."
+        msg = "👍 The token was not added to *My Tokens*."
         if token_key and db.get_tracked_token(cid, token_key):
             db.untrack_token(cid, token_key)
             db.save()
-            msg = f"🗑️ تم حذف *{escape_markdown(symbol, version=1)}* من *My Tokens*."
+            msg = f"🗑️ *{escape_markdown(symbol, version=1)}* was removed from *My Tokens*."
 
         context.user_data.pop("pending_track", None)
         db.get_user(cid).pop("pending_track", None)
