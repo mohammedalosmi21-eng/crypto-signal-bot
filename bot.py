@@ -31,7 +31,7 @@ FIXES in this version (V10 — callback resolution):
   are visible in production logs.
 """
 
-print("=== DEPLOY MARKER V11-BTN-TRACE ===")
+print("=== DEPLOY MARKER V12-PENDING-TRACK ===")
 
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, LabeledPrice
@@ -934,11 +934,14 @@ def main_menu_for(chat_id: int) -> InlineKeyboardMarkup:
 
 
 def track_prompt_menu(chat_id: int, token_key: str) -> InlineKeyboardMarkup:
-    token_ref = remember_token_ref(chat_id, token_key)
+    # Use short fixed callback_data for the initial search-result prompt.
+    # The actual token is resolved from persisted pending_track, which is more
+    # reliable than shipping token refs here.
+    remember_token_ref(chat_id, token_key)
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("✅ Track this token", callback_data=f"track_add:{token_ref}"),
-            InlineKeyboardButton("❌ No thanks", callback_data=f"track_skip:{token_ref}"),
+            InlineKeyboardButton("✅ Track this token", callback_data="track_add_pending"),
+            InlineKeyboardButton("❌ No thanks", callback_data="track_skip_pending"),
         ]
     ])
 
@@ -2101,119 +2104,88 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # ── track_add ──────────────────────────────────────────────────────────
-    if data.startswith("track_add:"):
-        await log_button_trace(context, cid, data, "TRACK_ADD_START")
-        token_ref = data.split(":", 1)[1]
-        token_key = resolve_token_ref_robust(cid, token_ref, context)
-        await log_button_trace(context, cid, data, "TRACK_ADD_RESOLVED", str(token_key))
-        pending = context.user_data.get("pending_track") or {}
-        if (not token_key or token_key == token_ref) and pending.get("token_key"):
-            token_key = pending.get("token_key")
-        symbol = pending.get("symbol", token_key)
+    if data == "track_add_pending" or data.startswith("track_add:"):
+        pending = context.user_data.get("pending_track") or db.get_user(cid).get("pending_track") or {}
+        token_key = pending.get("token_key")
+        symbol = pending.get("symbol", "Token")
         name = pending.get("name", symbol)
-        chain = pending.get("chain", parse_token_key(token_key)[0] or "bsc")
+        chain = pending.get("chain", "bsc")
 
-        existing = db.get_tracked_token(cid, token_key)
-        if existing:
-            symbol = existing.get("symbol", symbol)
-            text = f"✅ *{escape_markdown(symbol, version=1)}* is already in your tracked list."
+        if (not token_key) and data.startswith("track_add:"):
+            token_ref = data.split(":", 1)[1]
+            token_key = resolve_token_ref_robust(cid, token_ref, context)
+            existing = db.get_tracked_token(cid, token_key)
+            if existing:
+                symbol = existing.get("symbol", symbol)
+                name = existing.get("name", name)
+                chain = existing.get("chain", chain)
+
+        if not token_key:
             await context.bot.send_message(
                 cid,
-                text,
-                parse_mode="Markdown",
-                reply_markup=tracked_token_action_menu(cid, token_key),
+                "⚠️ Could not identify the token to add. Please search again.",
+                reply_markup=main_menu_for(cid),
             )
-            try:
-                await query.edit_message_reply_markup(reply_markup=None)
-            except Exception as e:
-                log.debug(f"track_add(existing): edit_message_reply_markup non-fatal: {e}")
             return
 
-        current_limit = tracked_token_limit_for(cid)
-        if len(db.get_tracked(cid)) >= current_limit:
-            text = f"⛔ Tracking limit reached. Your current tier allows *{current_limit}* tracked tokens."
-            await context.bot.send_message(cid, text, parse_mode="Markdown", reply_markup=premium_gate_menu())
-            try:
-                await query.edit_message_reply_markup(reply_markup=None)
-            except Exception as e:
-                log.debug(f"track_add(limit): edit_message_reply_markup non-fatal: {e}")
-            return
+        existing = db.get_tracked_token(cid, token_key)
+        if not existing:
+            current_limit = tracked_token_limit_for(cid)
+            if len(db.get_tracked(cid)) >= current_limit:
+                text = f"⛔ Tracking limit reached. Your current tier allows *{current_limit}* tracked tokens."
+                await context.bot.send_message(cid, text, parse_mode="Markdown", reply_markup=premium_gate_menu())
+                return
+            db.track_token(cid, token_key, symbol, name, chain)
+            db.save()
+            text = f"✅ *{escape_markdown(symbol, version=1)}* تمت إضافتها إلى *My Tokens*."
+        else:
+            symbol = existing.get("symbol", symbol)
+            text = f"✅ *{escape_markdown(symbol, version=1)}* موجودة بالفعل داخل *My Tokens*."
 
-        await log_button_trace(context, cid, data, "TRACK_ADD_BEFORE_SAVE", token_key)
-        db.track_token(cid, token_key, symbol, name, chain)
-        db.save()
-        await log_button_trace(context, cid, data, "TRACK_ADD_AFTER_SAVE", token_key)
         context.user_data.pop("pending_track", None)
-        # FIX: also clear persisted pending_track from user record
         db.get_user(cid).pop("pending_track", None)
         db.save()
 
-        text = (
-            f"✅ *{escape_markdown(symbol, version=1)}* was added to *My Tokens*.\n\n"
-            "You can manage its alerts below or go back to the main menu."
-        )
         await context.bot.send_message(
             cid,
             text,
             parse_mode="Markdown",
-            reply_markup=tracked_token_action_menu(cid, token_key),
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📋 My Tokens", callback_data="my_tokens")],
+                [InlineKeyboardButton("⬅️ Main Menu", callback_data="back_main")],
+            ]),
         )
-        try:
-            await query.edit_message_text(
-                f"📦 *{escape_markdown(symbol, version=1)}* added successfully.",
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("📋 My Tokens", callback_data="my_tokens")],
-                    [InlineKeyboardButton("⬅️ Main Menu", callback_data="back_main")],
-                ]),
-            )
-        except Exception as e:
-            log.debug(f"track_add: edit_message_text non-fatal: {e}")
         return
 
     # ── track_skip ─────────────────────────────────────────────────────────
-    if data.startswith("track_skip:"):
-        await log_button_trace(context, cid, data, "TRACK_SKIP_START")
-        token_ref = data.split(":", 1)[1]
-        token_key = resolve_token_ref_robust(cid, token_ref, context)
-        await log_button_trace(context, cid, data, "TRACK_SKIP_RESOLVED", str(token_key))
-        entry = db.get_tracked_token(cid, token_key)
+    if data == "track_skip_pending" or data.startswith("track_skip:"):
+        pending = context.user_data.get("pending_track") or db.get_user(cid).get("pending_track") or {}
+        token_key = pending.get("token_key")
+        symbol = pending.get("symbol", "Token")
 
-        if entry:
-            safe_symbol = escape_markdown(entry.get("symbol", token_key), version=1)
-            text = (
-                f"ℹ️ *{safe_symbol}* is already in your tracked list.\n\n"
-                "Manage alerts from *My Tokens* or return to the main menu."
-            )
-            await context.bot.send_message(
-                cid,
-                text,
-                parse_mode="Markdown",
-                reply_markup=tracked_token_action_menu(cid, token_key),
-            )
-            try:
-                await query.edit_message_reply_markup(reply_markup=None)
-            except Exception as e:
-                log.debug(f"track_skip(existing): edit_message_reply_markup non-fatal: {e}")
-        else:
-            context.user_data.pop("pending_track", None)
-            # FIX: also clear persisted pending_track from user record
-            db.get_user(cid).pop("pending_track", None)
+        if (not token_key) and data.startswith("track_skip:"):
+            token_ref = data.split(":", 1)[1]
+            token_key = resolve_token_ref_robust(cid, token_ref, context)
+            existing = db.get_tracked_token(cid, token_key)
+            if existing:
+                symbol = existing.get("symbol", symbol)
+
+        msg = "👍 لم تتم إضافة العملة إلى *My Tokens*."
+        if token_key and db.get_tracked_token(cid, token_key):
+            db.untrack_token(cid, token_key)
             db.save()
-            text = "👍 No problem. This token was not added to *My Tokens*."
-            await context.bot.send_message(
-                cid,
-                text,
-                parse_mode="Markdown",
-                reply_markup=main_menu_for(cid),
-            )
-            try:
-                await query.edit_message_text(
-                    "Skipped. Back to the main menu below.",
-                    reply_markup=main_menu_for(cid),
-                )
-            except Exception as e:
-                log.debug(f"track_skip: edit_message_text non-fatal: {e}")
+            msg = f"🗑️ تم حذف *{escape_markdown(symbol, version=1)}* من *My Tokens*."
+
+        context.user_data.pop("pending_track", None)
+        db.get_user(cid).pop("pending_track", None)
+        db.save()
+
+        await context.bot.send_message(
+            cid,
+            msg,
+            parse_mode="Markdown",
+            reply_markup=main_menu_for(cid),
+        )
         return
 
     # ── track_remove ───────────────────────────────────────────────────────
