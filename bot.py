@@ -31,7 +31,7 @@ FIXES in this version (V10 — callback resolution):
   are visible in production logs.
 """
 
-print("=== DEPLOY MARKER V14-DEBUG-CALLBACKS ===")
+print("=== DEPLOY MARKER V15-SAFE-EDIT ===")
 
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, LabeledPrice
@@ -127,6 +127,30 @@ async def log_button_trace(context, cid, data, stage, extra=""):
         await context.bot.send_message(OWNER_CHAT_ID, msg)
     except Exception:
         pass
+
+
+async def safe_edit_message_text(query, context, *args, **kwargs):
+    """
+    Try edit_message_text first. If Telegram rejects the edit (400 Bad Request,
+    old message, etc.), fall back to send_message so the user still sees a UI
+    response instead of a silent failure.
+    """
+    try:
+        return await safe_edit_message_text(query, context, *args, **kwargs)
+    except Exception as e:
+        log.warning(f"safe_edit_message_text fallback triggered: {e}")
+        text_arg = kwargs.get("text", args[0] if args else None)
+        if text_arg is None:
+            raise
+        send_kwargs = {}
+        for key in ("parse_mode", "reply_markup", "disable_web_page_preview"):
+            if key in kwargs:
+                send_kwargs[key] = kwargs[key]
+        return await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text=text_arg,
+            **send_kwargs,
+        )
 
 
 # ─────────────────────────────────────────────
@@ -1739,7 +1763,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "search_prompt":
         db.set_state(cid, "awaiting_search")
         try:
-            await query.edit_message_text("🔍 Send a token name, symbol, or contract address:")
+            await safe_edit_message_text(query, context, "🔍 Send a token name, symbol, or contract address:")
         except Exception:
             await context.bot.send_message(cid, "🔍 Send a token name, symbol, or contract address:")
         return
@@ -1747,7 +1771,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "alert_mode_menu":
         text = "⏱ *Alert Speed*\n\n⚡ *Fast Alerts* — best for active traders\n📊 *Normal* — balanced default\n📈 *Long-term* — low-noise monitoring\n\nChoose the mode that fits your style."
         try:
-            await query.edit_message_text(text, parse_mode="Markdown", reply_markup=alert_mode_menu(cid))
+            await safe_edit_message_text(query, context, text, parse_mode="Markdown", reply_markup=alert_mode_menu(cid))
         except Exception:
             await context.bot.send_message(cid, text, parse_mode="Markdown", reply_markup=alert_mode_menu(cid))
         return
@@ -1761,7 +1785,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         db.save()
         text = f"✅ Alert mode set to *{alert_mode_label(mode)}*\n\nCurrent cadence target: ~{alert_check_interval_seconds(cid)//60} minutes."
         try:
-            await query.edit_message_text(text, parse_mode="Markdown", reply_markup=main_menu_for(cid))
+            await safe_edit_message_text(query, context, text, parse_mode="Markdown", reply_markup=main_menu_for(cid))
         except Exception:
             await context.bot.send_message(cid, text, parse_mode="Markdown", reply_markup=main_menu_for(cid))
         return
@@ -1776,7 +1800,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not premium:
             text += "\n\n🔒 Full Alpha Breakdown is available in *Pro Alpha* and above."
         try:
-            await query.edit_message_text(text, parse_mode="Markdown", reply_markup=(premium_gate_menu() if not premium else main_menu_for(cid)))
+            await safe_edit_message_text(query, context, text, parse_mode="Markdown", reply_markup=(premium_gate_menu() if not premium else main_menu_for(cid)))
         except Exception:
             await context.bot.send_message(cid, text, parse_mode="Markdown", reply_markup=(premium_gate_menu() if not premium else main_menu_for(cid)))
         return
@@ -1789,7 +1813,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         db.save()
         text = "⚙️ *Custom Filters*\n\nElite mode unlocked. In the next phase we can wire bespoke liquidity / volume / signal thresholds for your workflow."
         try:
-            await query.edit_message_text(text, parse_mode="Markdown", reply_markup=main_menu_for(cid))
+            await safe_edit_message_text(query, context, text, parse_mode="Markdown", reply_markup=main_menu_for(cid))
         except Exception:
             await context.bot.send_message(cid, text, parse_mode="Markdown", reply_markup=main_menu_for(cid))
         return
@@ -1797,7 +1821,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "subscribe_info":
         text = build_subscription_hub(cid) + "\n\n" + premium_plan_card("trader") + "\n\n" + premium_plan_card("pro") + "\n\n" + premium_plan_card("elite")
         try:
-            await query.edit_message_text(text, parse_mode="Markdown", reply_markup=payment_options_menu())
+            await safe_edit_message_text(query, context, text, parse_mode="Markdown", reply_markup=payment_options_menu())
         except Exception:
             await context.bot.send_message(cid, text, parse_mode="Markdown", reply_markup=payment_options_menu())
         return
@@ -1805,7 +1829,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "subscribe_usdt":
         text = build_subscription_hub(cid) + "\n\n*USDT settlement*\n" + "\n".join(f"• {PLAN_CATALOG[k]['label']}: {PLAN_CATALOG[k]['usdt']} USDT / {PLAN_CATALOG[k]['days']} days" for k in ["trader", "pro", "elite"]) + f"\n\nNetwork: {PAYMENT_NETWORK}\nAddress: `{PAYMENT_WALLET}`\n\nAfter payment, send proof to the developer for activation."
         try:
-            await query.edit_message_text(text, parse_mode="Markdown", reply_markup=payment_options_menu())
+            await safe_edit_message_text(query, context, text, parse_mode="Markdown", reply_markup=payment_options_menu())
         except Exception:
             await context.bot.send_message(cid, text, parse_mode="Markdown", reply_markup=payment_options_menu())
         return
@@ -1827,7 +1851,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "🐋 Smart Money Alerts and ⚠️ Manipulation Alerts remain unchanged, so you can run any one mode or all three together."
         )
         try:
-            await query.edit_message_text(text, parse_mode="Markdown", reply_markup=main_menu_for(cid))
+            await safe_edit_message_text(query, context, text, parse_mode="Markdown", reply_markup=main_menu_for(cid))
         except Exception:
             await context.bot.send_message(cid, text, parse_mode="Markdown", reply_markup=main_menu_for(cid))
         return
@@ -1841,7 +1865,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "🐋 Smart Money Alerts and your tracked tokens are unaffected."
         )
         try:
-            await query.edit_message_text(text, parse_mode="Markdown", reply_markup=main_menu_for(cid))
+            await safe_edit_message_text(query, context, text, parse_mode="Markdown", reply_markup=main_menu_for(cid))
         except Exception:
             await context.bot.send_message(cid, text, parse_mode="Markdown", reply_markup=main_menu_for(cid))
         return
@@ -1859,7 +1883,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "🔥 New Token Alerts and ⚠️ Manipulation Alerts remain unchanged, so you can run any one mode or all three together."
         )
         try:
-            await query.edit_message_text(text, parse_mode="Markdown", reply_markup=main_menu_for(cid))
+            await safe_edit_message_text(query, context, text, parse_mode="Markdown", reply_markup=main_menu_for(cid))
         except Exception:
             await context.bot.send_message(cid, text, parse_mode="Markdown", reply_markup=main_menu_for(cid))
         return
@@ -1873,7 +1897,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "🔥 New Token Alerts and your tracked tokens are unaffected."
         )
         try:
-            await query.edit_message_text(text, parse_mode="Markdown", reply_markup=main_menu_for(cid))
+            await safe_edit_message_text(query, context, text, parse_mode="Markdown", reply_markup=main_menu_for(cid))
         except Exception:
             await context.bot.send_message(cid, text, parse_mode="Markdown", reply_markup=main_menu_for(cid))
         return
@@ -1891,7 +1915,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "🔥 New Token Alerts and 🐋 Smart Money Alerts remain unchanged."
         )
         try:
-            await query.edit_message_text(text, parse_mode="Markdown", reply_markup=main_menu_for(cid))
+            await safe_edit_message_text(query, context, text, parse_mode="Markdown", reply_markup=main_menu_for(cid))
         except Exception:
             await context.bot.send_message(cid, text, parse_mode="Markdown", reply_markup=main_menu_for(cid))
         return
@@ -1905,7 +1929,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "🔥 New Token Alerts and 🐋 Smart Money Alerts remain unchanged."
         )
         try:
-            await query.edit_message_text(text, parse_mode="Markdown", reply_markup=main_menu_for(cid))
+            await safe_edit_message_text(query, context, text, parse_mode="Markdown", reply_markup=main_menu_for(cid))
         except Exception:
             await context.bot.send_message(cid, text, parse_mode="Markdown", reply_markup=main_menu_for(cid))
         return
@@ -1931,7 +1955,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"⏱ Manipulation Last Check: {db.manipulation_last_check_time}"
         )
         try:
-            await query.edit_message_text(text, parse_mode="Markdown", reply_markup=main_menu_for(cid))
+            await safe_edit_message_text(query, context, text, parse_mode="Markdown", reply_markup=main_menu_for(cid))
         except Exception:
             await context.bot.send_message(cid, text, parse_mode="Markdown", reply_markup=main_menu_for(cid))
         return
@@ -1948,7 +1972,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "*Tracked Tokens* — your personal watchlist with custom alert settings."
         )
         try:
-            await query.edit_message_text(text, parse_mode="Markdown", reply_markup=main_menu_for(cid))
+            await safe_edit_message_text(query, context, text, parse_mode="Markdown", reply_markup=main_menu_for(cid))
         except Exception:
             await context.bot.send_message(cid, text, parse_mode="Markdown", reply_markup=main_menu_for(cid))
         return
@@ -1961,7 +1985,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Use this for feedback, bug reports, or feature requests."
         )
         try:
-            await query.edit_message_text(text, parse_mode="Markdown")
+            await safe_edit_message_text(query, context, text, parse_mode="Markdown")
         except Exception:
             await context.bot.send_message(cid, text, parse_mode="Markdown")
         return
@@ -1969,7 +1993,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "back_main":
         text = "🚀 *Only Signals — V2*\nChoose an option below:"
         try:
-            await query.edit_message_text(text, parse_mode="Markdown", reply_markup=main_menu_for(cid))
+            await safe_edit_message_text(query, context, text, parse_mode="Markdown", reply_markup=main_menu_for(cid))
         except Exception:
             await context.bot.send_message(cid, text, parse_mode="Markdown", reply_markup=main_menu_for(cid))
         return
@@ -1986,7 +2010,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text = "📋 *Your Tracked Tokens*\nTap a token to manage its alert settings."
             kb = my_tokens_menu(cid)
         try:
-            await query.edit_message_text(text, parse_mode="Markdown", reply_markup=kb)
+            await safe_edit_message_text(query, context, text, parse_mode="Markdown", reply_markup=kb)
         except Exception:
             await context.bot.send_message(cid, text, parse_mode="Markdown", reply_markup=kb)
         return
@@ -2035,7 +2059,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
         try:
-            await query.edit_message_text(text, parse_mode="Markdown", reply_markup=token_delete_confirm_menu(cid, token_key))
+            await safe_edit_message_text(query, context, text, parse_mode="Markdown", reply_markup=token_delete_confirm_menu(cid, token_key))
         except Exception:
             await context.bot.send_message(cid, text, parse_mode="Markdown", reply_markup=token_delete_confirm_menu(cid, token_key))
         return
@@ -2068,7 +2092,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if delivered:
             try:
-                await query.edit_message_text(
+                await safe_edit_message_text(query, context, 
                     "⚙️ Alert settings opened below.",
                     reply_markup=InlineKeyboardMarkup([
                         [InlineKeyboardButton("📋 My Tracked Tokens", callback_data="my_tokens")],
@@ -2099,7 +2123,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Press *No* to return to the main menu."
         )
         try:
-            await query.edit_message_text(text, parse_mode="Markdown", reply_markup=token_delete_confirm_menu(cid, token_key))
+            await safe_edit_message_text(query, context, text, parse_mode="Markdown", reply_markup=token_delete_confirm_menu(cid, token_key))
         except Exception:
             await context.bot.send_message(cid, text, parse_mode="Markdown", reply_markup=token_delete_confirm_menu(cid, token_key))
         return
@@ -2200,7 +2224,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.pop("pending_track", None)
         text = f"🗑 *{escape_markdown(symbol, version=1)}* was removed from your tracked list."
         try:
-            await query.edit_message_text(text, parse_mode="Markdown", reply_markup=main_menu_for(cid))
+            await safe_edit_message_text(query, context, text, parse_mode="Markdown", reply_markup=main_menu_for(cid))
         except Exception:
             await context.bot.send_message(cid, text, parse_mode="Markdown", reply_markup=main_menu_for(cid))
         return
@@ -2290,7 +2314,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ── Catch-all for any unrecognised callback_data ───────────────────────
     log.warning(f"button_handler: unrecognised callback data={data!r} from cid={cid}")
     try:
-        await query.edit_message_text("Unknown option.", reply_markup=main_menu_for(cid))
+        await safe_edit_message_text(query, context, "Unknown option.", reply_markup=main_menu_for(cid))
     except Exception:
         await context.bot.send_message(cid, "Unknown option.", reply_markup=main_menu_for(cid))
 
@@ -2763,7 +2787,7 @@ async def handle_manage_alerts_direct(update: Update, context: ContextTypes.DEFA
         return
 
     try:
-        await query.edit_message_text(
+        await safe_edit_message_text(query, context, 
             "⚙️ Alert settings opened below.",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("📋 My Tokens", callback_data="my_tokens")],
@@ -2843,7 +2867,6 @@ try:
 except Exception as e:
     log.warning(f"Could not start job queue: {e}")
 
-log.info("=== DEPLOY MARKER V14-DEBUG-CALLBACKS ===")
+log.info("=== DEPLOY MARKER V15-SAFE-EDIT ===")
 log.info("Quantara UI premium alpha running...")
 app.run_polling()
-
