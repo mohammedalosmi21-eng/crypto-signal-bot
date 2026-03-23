@@ -31,7 +31,7 @@ FIXES in this version (V10 — callback resolution):
   are visible in production logs.
 """
 
-print("=== DEPLOY MARKER V15-SAFE-EDIT ===")
+print("=== DEPLOY MARKER V16-SAFE-EDIT-FIXED ===")
 
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, LabeledPrice
@@ -131,12 +131,12 @@ async def log_button_trace(context, cid, data, stage, extra=""):
 
 async def safe_edit_message_text(query, context, *args, **kwargs):
     """
-    Try edit_message_text first. If Telegram rejects the edit (400 Bad Request,
-    old message, etc.), fall back to send_message so the user still sees a UI
-    response instead of a silent failure.
+    Try query.edit_message_text() first. If Telegram rejects the edit
+    (400 Bad Request, message not modified, old message, etc.), fall back to
+    send_message so the user still sees a visible response.
     """
     try:
-        return await safe_edit_message_text(query, context, *args, **kwargs)
+        return await query.edit_message_text(*args, **kwargs)
     except Exception as e:
         log.warning(f"safe_edit_message_text fallback triggered: {e}")
         text_arg = kwargs.get("text", args[0] if args else None)
@@ -2867,6 +2867,6 @@ try:
 except Exception as e:
     log.warning(f"Could not start job queue: {e}")
 
-log.info("=== DEPLOY MARKER V15-SAFE-EDIT ===")
+log.info("=== DEPLOY MARKER V16-SAFE-EDIT-FIXED ===")
 log.info("Quantara UI premium alpha running...")
 app.run_polling()
