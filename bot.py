@@ -1722,10 +1722,8 @@ async def upgrade_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if len(context.args) < 1:
         await update.message.reply_text(
-            "Usage: /upgrade <chat_id> [plan] [days]
-"
-            "Example: /upgrade 123456789
-"
+            "Usage: /upgrade <chat_id> [plan] [days]\n"
+            "Example: /upgrade 123456789\n"
             "Example: /upgrade 123456789 pro 30"
         )
         return
@@ -1738,12 +1736,11 @@ async def upgrade_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     plan_key = (context.args[1].strip().lower() if len(context.args) >= 2 else "pro")
     if plan_key not in PLAN_CATALOG:
-        await update.message.reply_text("Invalid plan. Use: trader, pro, elite")
+        await update.message.reply_text("Invalid plan. Use trader / pro / elite.")
         return
 
-    default_days = int(PLAN_CATALOG[plan_key].get("days", PREMIUM_DAYS))
     try:
-        days = int(context.args[2]) if len(context.args) >= 3 else default_days
+        days = int(context.args[2]) if len(context.args) >= 3 else PLAN_CATALOG[plan_key]["days"]
     except Exception:
         await update.message.reply_text("Invalid days value.")
         return
@@ -1761,17 +1758,16 @@ async def upgrade_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await context.bot.send_message(
             target_chat_id,
-            f"✅ *Admin Upgrade Applied*
-
-Your access has been upgraded to *{plan_label}* for *{days} days*.
-
-Use /start to refresh your menu.",
+            (
+                f"✅ *Admin Upgrade Applied*\n\n"
+                f"Your access has been upgraded to *{plan_label}* for *{days} days*.\n\n"
+                "Use /start to refresh your menu."
+            ),
             parse_mode="Markdown",
             reply_markup=main_menu_for(target_chat_id),
         )
     except Exception as e:
         log.warning(f"upgrade_command: failed to notify {target_chat_id}: {e}")
-
 
 async def analyze_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await search_command(update, context)
