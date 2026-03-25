@@ -31,7 +31,7 @@ FIXES in this version (V10 — callback resolution):
   are visible in production logs.
 """
 
-print("=== DEPLOY MARKER V22-GROQ-OPENROUTER-AI ===")
+print("=== DEPLOY MARKER V25-STARS-RECURRING-PAYLOAD ===")
 
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, LabeledPrice
@@ -72,6 +72,8 @@ ELITE_STARS_PRICE = int(os.getenv("ELITE_STARS_PRICE", "1200"))
 PAYMENT_WALLET = os.getenv("PAYMENT_WALLET", "0x73c95943191fddc3e44fff22749c4ccc1ccc8a08")
 PAYMENT_NETWORK = os.getenv("PAYMENT_NETWORK", "BEP20 (BSC)")
 SUBSCRIPTION_PRICE_USDT = float(os.getenv("SUBSCRIPTION_PRICE_USDT", "10"))
+
+STARS_SUBSCRIPTION_PERIOD = int(os.getenv("STARS_SUBSCRIPTION_PERIOD", "2592000"))
 
 PLAN_CATALOG = {
     "trader": {"label": "Trader", "rank": 1, "stars": TRADER_STARS_PRICE, "usdt": 5, "days": 30, "headline": "Fast alerts + cleaner execution", "features": ["⚡ Fast Alerts mode", "📦 Up to 15 tracked tokens", "🔔 Basic alerts with faster cadence", "🧪 Alpha Preview"]},
@@ -337,6 +339,38 @@ def alert_check_interval_seconds(chat_id: int) -> int:
         return 86400
     return 10800
 
+
+
+
+def build_star_invoice_payload(plan_key: str, chat_id: int) -> str:
+    return f"stars_sub:{plan_key}:{chat_id}:{int(datetime.now().timestamp())}"
+
+
+def parse_star_invoice_payload(payload: str) -> dict:
+    parts = str(payload or "").split(":")
+    if len(parts) >= 4 and parts[0] == "stars_sub":
+        return {
+            "kind": parts[0],
+            "plan_key": parts[1],
+            "chat_id": parts[2],
+            "nonce": parts[3],
+        }
+    return {"kind": "unknown", "plan_key": "pro", "chat_id": None, "nonce": None}
+
+
+def payment_success_text(plan_label: str, recurring: bool, first_recurring: bool, expiration_ts) -> str:
+    base = f"✅ *{plan_label}* activated."
+    if recurring and first_recurring:
+        base += "\n\n🔁 Auto-renewal is now enabled via Telegram Stars."
+    elif recurring:
+        base += "\n\n🔁 Your recurring Telegram Stars subscription was renewed automatically."
+    if expiration_ts:
+        try:
+            exp_str = datetime.fromtimestamp(int(expiration_ts)).strftime("%Y-%m-%d %H:%M:%S")
+            base += f"\n⏳ Active until: *{exp_str}*"
+        except Exception:
+            pass
+    return base
 
 def premium_plan_card(plan_key: str) -> str:
     plan = PLAN_CATALOG[plan_key]
@@ -1680,6 +1714,65 @@ async def activatepaid_command(update: Update, context: ContextTypes.DEFAULT_TYP
         pass
 
 
+async def upgrade_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cid = update.effective_chat.id
+    if cid != OWNER_CHAT_ID:
+        await update.message.reply_text("⛔ Owner only.")
+        return
+
+    if len(context.args) < 1:
+        await update.message.reply_text(
+            "Usage: /upgrade <chat_id> [plan] [days]
+"
+            "Example: /upgrade 123456789
+"
+            "Example: /upgrade 123456789 pro 30"
+        )
+        return
+
+    try:
+        target_chat_id = int(context.args[0])
+    except Exception:
+        await update.message.reply_text("Invalid chat_id.")
+        return
+
+    plan_key = (context.args[1].strip().lower() if len(context.args) >= 2 else "pro")
+    if plan_key not in PLAN_CATALOG:
+        await update.message.reply_text("Invalid plan. Use: trader, pro, elite")
+        return
+
+    default_days = int(PLAN_CATALOG[plan_key].get("days", PREMIUM_DAYS))
+    try:
+        days = int(context.args[2]) if len(context.args) >= 3 else default_days
+    except Exception:
+        await update.message.reply_text("Invalid days value.")
+        return
+
+    user = db.get_user(target_chat_id)
+    user["is_paid"] = True
+    user["paid_until"] = (datetime.now() + timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
+    user["subscription_plan"] = f"manual_{plan_key}_{days}d"
+    user["subscription_tier"] = plan_key
+    user["payment_method"] = "admin_grant"
+    db.save()
+
+    plan_label = PLAN_CATALOG[plan_key]["label"]
+    await update.message.reply_text(f"✅ Upgraded {target_chat_id} to {plan_label} for {days} day(s).")
+    try:
+        await context.bot.send_message(
+            target_chat_id,
+            f"✅ *Admin Upgrade Applied*
+
+Your access has been upgraded to *{plan_label}* for *{days} days*.
+
+Use /start to refresh your menu.",
+            parse_mode="Markdown",
+            reply_markup=main_menu_for(target_chat_id),
+        )
+    except Exception as e:
+        log.warning(f"upgrade_command: failed to notify {target_chat_id}: {e}")
+
+
 async def analyze_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await search_command(update, context)
 
@@ -2041,15 +2134,15 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data in {"plan_trader", "plan_pro", "plan_elite"}:
         plan_key = data.split("_", 1)[1]
         plan = PLAN_CATALOG[plan_key]
-        context.user_data["pending_plan"] = plan_key
-        prices = [LabeledPrice(f"{plan['label']} - {plan['days']} days", plan["stars"])]
+        prices = [LabeledPrice(f"{plan['label']} - recurring every {plan['days']} days", plan["stars"])]
         await context.bot.send_invoice(
             chat_id=cid,
             title=f"Quantara {plan['label']}",
-            description=plan["headline"],
-            payload=f"{plan_key}_{cid}_{int(datetime.now().timestamp())}",
+            description=f"{plan['headline']}\n\nTelegram Stars subscription billed every {plan['days']} days.",
+            payload=build_star_invoice_payload(plan_key, cid),
             currency="XTR",
             prices=prices,
+            subscription_period=STARS_SUBSCRIPTION_PERIOD,
         )
         return
 
@@ -2217,17 +2310,30 @@ async def precheckout_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def successful_payment_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cid = update.effective_chat.id
-    user = db.get_user(cid)
-    plan_key = context.user_data.get("pending_plan", "pro")
+    payment = update.message.successful_payment
+    payload_data = parse_star_invoice_payload(getattr(payment, "invoice_payload", ""))
+    plan_key = payload_data.get("plan_key", "pro")
     plan = PLAN_CATALOG.get(plan_key, PLAN_CATALOG["pro"])
+
+    user = db.get_user(cid)
+    expiration_ts = getattr(payment, "subscription_expiration_date", None)
+    is_recurring = bool(getattr(payment, "is_recurring", False))
+    is_first_recurring = bool(getattr(payment, "is_first_recurring", False))
+
     user["is_paid"] = True
-    user["paid_until"] = (datetime.now() + timedelta(days=plan["days"])).strftime("%Y-%m-%d %H:%M:%S")
-    user["subscription_plan"] = plan_key
+    if expiration_ts:
+        user["paid_until"] = datetime.fromtimestamp(int(expiration_ts)).strftime("%Y-%m-%d %H:%M:%S")
+    else:
+        user["paid_until"] = (datetime.now() + timedelta(days=plan["days"])).strftime("%Y-%m-%d %H:%M:%S")
+    user["subscription_plan"] = f"stars_recurring_{plan_key}" if is_recurring else f"stars_{plan_key}"
     user["subscription_tier"] = plan_key
-    user["payment_method"] = "telegram_stars"
+    user["payment_method"] = "telegram_stars_recurring" if is_recurring else "telegram_stars"
+    user["last_telegram_payment_charge_id"] = getattr(payment, "telegram_payment_charge_id", None)
+    user["last_invoice_payload"] = getattr(payment, "invoice_payload", None)
     db.save()
+
     await update.message.reply_text(
-        f"✅ *{plan['label']}* activated for *{plan['days']} days*.",
+        payment_success_text(plan["label"], is_recurring, is_first_recurring, expiration_ts),
         parse_mode="Markdown",
         reply_markup=main_menu_for(cid),
     )
@@ -2286,6 +2392,7 @@ def build_application():
     app.add_handler(CommandHandler("reply", reply_command))
     app.add_handler(CommandHandler("myid", myid_command))
     app.add_handler(CommandHandler("activatepaid", activatepaid_command))
+    app.add_handler(CommandHandler("upgrade", upgrade_command))
     app.add_handler(CommandHandler("analytics", analytics_command))
     app.add_handler(CommandHandler("aiinsight", aiinsight_command))
 
